@@ -1,0 +1,8 @@
+{
+  "name": "openpets-spotify",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@open-pets/client": "^2.1.1"
+  }
+}
