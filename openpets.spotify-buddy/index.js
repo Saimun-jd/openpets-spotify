@@ -1,5 +1,6 @@
-const DEFAULT_POLL_INTERVAL_SECONDS = 30;
-const MIN_POLL_INTERVAL_SECONDS = 10;
+
+const DEFAULT_POLL_INTERVAL_SECONDS = 2;
+const MIN_POLL_INTERVAL_SECONDS = 1;
 const MAX_ANNOUNCEMENT_LENGTH = 140;
 const EMPTY_TRACK_ID = "__no_track__";
 const UNSAFE_MESSAGE_PATTERN = /```|<script|function\s+\w+|=>|\b(class|import|export|const|let|var)\b|https?:\/\/|www\.|\/[\w.-]+\/[\w./-]+|[A-Za-z]:\\|api[_-]?key|secret|token|password|passwd|BEGIN [A-Z ]+PRIVATE KEY/i;
@@ -80,6 +81,8 @@ async function checkNow(ctx, manual) {
 
       await ctx.storage.set("spotify-lastPlaying", false);
       await ctx.storage.set("spotify-lastTrackId", EMPTY_TRACK_ID);
+      await ctx.storage.set("spotify-lyrics", null);
+      await ctx.storage.set("spotify-lastLyricIndex", -1);
       return;
     }
 
@@ -98,13 +101,36 @@ async function checkNow(ctx, manual) {
       if (config.reactToMood) {
         const reaction = featuresToReaction(nowPlaying.features);
         await ctx.pet.react(reaction);
+      } else {
+        await ctx.pet.react("celebrating");
       }
 
+      // Reset and fetch lyrics for new track!
       await ctx.storage.set("spotify-lastTrackId", currentTrackId);
+      await ctx.storage.set("spotify-lastLyricIndex", -1);
+      const lyricsData = await fetchFromBridge(ctx, config.bridgeUrl, "/lyrics");
+      await ctx.storage.set("spotify-lyrics", lyricsData?.lyrics?.synced || null);
+      ctx.log?.info?.("Loaded synced lyrics for new track:", lyricsData?.lyrics?.synced);
+    }
+
+    // Check for current lyric line!
+    const currentLyrics = await ctx.storage.get("spotify-lyrics");
+    const lastShownLineIndex = Number(await ctx.storage.get("spotify-lastLyricIndex") || -1);
+    if (currentLyrics && nowPlaying.progressMs !== undefined) {
+      const currentLineIndex = findLastIndex(currentLyrics, line => line.timestamp <= nowPlaying.progressMs);
+      if (currentLineIndex !== -1 && currentLineIndex !== lastShownLineIndex) {
+        await ctx.storage.set("spotify-lastLyricIndex", currentLineIndex);
+        const line = currentLyrics[currentLineIndex];
+        ctx.log?.info?.("Showing lyric line:", line);
+        const cleanLine = safeText(line.text, "");
+        if (cleanLine) {
+          await ctx.pet.speak(cleanLine);
+        }
+      }
     }
 
     await ctx.storage.set("spotify-lastPlaying", true);
-    await ctx.status.set({ text: `Spotify: ${safeText(nowPlaying.title || "Unknown track", "Unknown track")}`, tone: "success" });
+    await ctx.status.set({ text: `Spotify: ${safeText(nowPlaying.title || "Unknown track", "Unknown track")} 🎶`, tone: "success" });
 
     if (manual && !trackChanged) {
       await ctx.pet.speak(format(config.announceTemplate || "Now playing: {title} by {artist}", {
@@ -137,6 +163,8 @@ async function showWhatsPlaying(ctx) {
 async function resetSpotifyState(ctx) {
   await ctx.storage.delete("spotify-lastTrackId");
   await ctx.storage.delete("spotify-lastPlaying");
+  await ctx.storage.delete("spotify-lyrics");
+  await ctx.storage.delete("spotify-lastLyricIndex");
   await ctx.status.set({ text: "Spotify: state cleared", tone: "neutral" });
   await ctx.pet.speak("Spotify state has been reset.");
   await checkNow(ctx, false);
@@ -169,21 +197,20 @@ async function showLyrics(ctx) {
     return;
   }
 
-  if (!data.lyrics) {
+  if (!data.lyrics?.plain && !data.lyrics?.synced) {
     await ctx.pet.speak("Sorry, I couldn't find lyrics for this song!");
     return;
   }
 
-  // Clean up lyrics: remove timestamps (if synced) and get a snippet
-  let lyrics = data.lyrics
-    .replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "") // remove [mm:ss.xxx] timestamps
-    .replace(/\r?\n\r?\n/g, " ") // replace newlines
+  const lyrics = data.lyrics.plain || data.lyrics.synced.map(l => l.text).join(" ");
+  let cleanLyrics = lyrics
+    .replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "")
+    .replace(/\r?\n\r?\n/g, " ")
     .trim();
 
-  // Take first ~140 characters for pet speak
-  const snippet = lyrics.length > 140
-    ? lyrics.slice(0, 137).trim() + "..."
-    : lyrics;
+  const snippet = cleanLyrics.length > 140
+    ? cleanLyrics.slice(0, 137).trim() + "..."
+    : cleanLyrics;
 
   if (snippet) {
     await ctx.pet.speak(safeText(snippet, "Here are some lyrics for this song!"));
@@ -214,7 +241,7 @@ async function fetchFromBridge(ctx, bridgeUrl, path) {
 }
 
 function featuresToReaction(features) {
-  if (!features) return "working";
+  if (!features) return "celebrating";
   const energy = Number(features.energy || 0);
   const valence = Number(features.valence || 0);
   const tempo = Number(features.tempo || 0);
@@ -235,4 +262,13 @@ function safeText(value, fallback = "") {
 
 function format(template, values) {
   return safeText(String(template).replace(/\{(title|artist)\}/g, (_m, key) => safeText(values[key] || "")));
+}
+
+function findLastIndex(arr, predicate) {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (predicate(arr[i], i, arr)) {
+      return i;
+    }
+  }
+  return -1;
 }

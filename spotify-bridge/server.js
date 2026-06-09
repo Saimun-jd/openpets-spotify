@@ -99,20 +99,99 @@ function httpsPost(url, body, headers) {
   });
 }
 
-async function fetchLyrics(artist, title, album, durationMs) {
+function cleanTrackName(name) {
+  if (!name) return name;
+  return name
+    .replace(/\s*(?:-\s*)?(?:Remaster(?:ed)?|Live|From.*?Session|Edit|Version|Mix|Acoustic|Instrumental|Radio Edit)(?:\s*\d{4})?\s*$/i, "")
+    .replace(/\s*\([^)]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^)]*\)/gi, "")
+    .replace(/\s*\[[^\]]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^\]]*\]/gi, "")
+    .trim();
+}
+
+async function tryLrclibSearch(artist, title, album, durationMs) {
   try {
-    const params = new URLSearchParams({
-      artist_name: artist,
-      track_name: title,
-      album_name: album || "",
-      duration: Math.round(durationMs / 1000)
-    });
+    const params = new URLSearchParams();
+    if (artist) params.set("artist_name", artist);
+    if (title) params.set("track_name", title);
+    if (album) params.set("album_name", album);
+    if (durationMs) params.set("duration", Math.round(durationMs / 1000));
+    
     const url = `https://lrclib.net/api/get?${params.toString()}`;
+    console.log(`Trying LRCLIB: ${url}`);
     const res = await httpsGet(url);
     if (res.status !== 200) return null;
-    const data = JSON.parse(res.body);
-    return data.plainLyrics || data.syncedLyrics || null;
+    return JSON.parse(res.body);
   } catch {
+    return null;
+  }
+}
+
+async function fetchLyrics(artist, title, album, durationMs) {
+  try {
+    // Clean the names first
+    const cleanedArtist = artist?.trim();
+    const cleanedTitle = cleanTrackName(title);
+    const cleanedAlbum = album?.trim();
+
+    console.log(`Searching lyrics for: ${cleanedArtist} - ${cleanedTitle} (${cleanedAlbum || 'no album'})`);
+
+    // Try multiple search strategies in order
+    let data = null;
+    
+    // 1. Try with all cleaned params first
+    data = await tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, durationMs);
+    if (data && (data.syncedLyrics || data.plainLyrics)) {
+      console.log("Found lyrics with full params!");
+    } else {
+      // 2. Try without album
+      data = await tryLrclibSearch(cleanedArtist, cleanedTitle, null, durationMs);
+      if (data && (data.syncedLyrics || data.plainLyrics)) {
+        console.log("Found lyrics without album!");
+      } else {
+        // 3. Try without duration
+        data = await tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, null);
+        if (data && (data.syncedLyrics || data.plainLyrics)) {
+          console.log("Found lyrics without duration!");
+        } else {
+          // 4. Try without album and duration
+          data = await tryLrclibSearch(cleanedArtist, cleanedTitle, null, null);
+          if (data && (data.syncedLyrics || data.plainLyrics)) {
+            console.log("Found lyrics with just artist and title!");
+          }
+        }
+      }
+    }
+
+    if (!data || (!data.syncedLyrics && !data.plainLyrics)) {
+      console.log("No lyrics found after all attempts");
+      return null;
+    }
+
+    // Parse synced lyrics into { timestamp, text } array
+    const syncedLines = [];
+    if (data.syncedLyrics) {
+      const lines = data.syncedLyrics.split(/\r?\n/);
+      for (const line of lines) {
+        const match = line.match(/\[(\d{2}):(\d{2})\.(\d{2,3})\]/);
+        if (match) {
+          const minutes = parseInt(match[1], 10);
+          const seconds = parseInt(match[2], 10);
+          const milliseconds = parseInt(match[3].padEnd(3, "0"), 10);
+          const totalMs = minutes * 60 * 1000 + seconds * 1000 + milliseconds;
+          const text = line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "").trim();
+          if (text) {
+            syncedLines.push({ timestamp: totalMs, text });
+          }
+        }
+      }
+    }
+
+    return {
+      plain: data.plainLyrics || null,
+      synced: syncedLines.length > 0 ? syncedLines : null
+    };
+  } catch (e) {
+    console.error("Error in fetchLyrics:", e);
     return null;
   }
 }

@@ -9,6 +9,7 @@ spotify-bridge/.tokens.json
 # Test files
 test-*.js
 test-*.mjs
+test-*.cjs
 get-ngrok-url.mjs
 final-test.mjs
 

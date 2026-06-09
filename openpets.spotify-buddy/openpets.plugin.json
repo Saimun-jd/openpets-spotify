@@ -17,7 +17,7 @@
       "default": "https://6b36-103-132-185-215.ngrok-free.app",
       "description": "Your ngrok HTTPS URL, e.g. https://abc123.ngrok-free.app"
     },
-    "pollIntervalSeconds": { "type": "number", "label": "Poll interval (seconds)", "default": 30, "min": 10, "max": 300, "step": 5 },
+    "pollIntervalSeconds": { "type": "number", "label": "Poll interval (seconds)", "default": 2, "min": 1, "max": 300, "step": 1 },
     "announceTrackChanges": { "type": "boolean", "label": "Announce track changes", "default": true },
     "reactToMood": { "type": "boolean", "label": "React to track mood", "default": true },
     "reactWhenPaused": { "type": "boolean", "label": "React when paused", "default": true },
