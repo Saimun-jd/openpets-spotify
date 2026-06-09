@@ -8,6 +8,7 @@ An OpenPets plugin that lets your desktop pet react to what's playing on Spotify
 - 😄 Mood-based reactions using Spotify audio features
 - ⏭️ Skip to next/previous track
 - 🔄 Track playback status
+- 📝 Fetch and recite lyrics snippet for current song!
 
 ## Prerequisites
 

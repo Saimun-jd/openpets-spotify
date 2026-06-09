@@ -30,6 +30,10 @@ export function register(OpenPetsPlugin) {
         await skipPrevious(ctx);
       });
 
+      await ctx.commands.register({ id: "spotify-show-lyrics", title: "Show Lyrics", description: "Have your pet recite some lyrics from the current song!" }, async () => {
+        await showLyrics(ctx);
+      });
+
       await scheduleNext(ctx);
       void checkNow(ctx, false).catch((error) => ctx.log?.warn?.("Spotify initial check failed", error?.message || String(error)));
     },
@@ -153,6 +157,38 @@ async function skipPrevious(ctx) {
   if (result?.ok) {
     await ctx.pet.speak("Playing previous track!");
     await checkNow(ctx, false);
+  }
+}
+
+async function showLyrics(ctx) {
+  const config = await ctx.config.get();
+  const data = await fetchFromBridge(ctx, config.bridgeUrl, "/lyrics");
+
+  if (!data) {
+    await ctx.pet.speak("Couldn't reach Spotify bridge.");
+    return;
+  }
+
+  if (!data.lyrics) {
+    await ctx.pet.speak("Sorry, I couldn't find lyrics for this song!");
+    return;
+  }
+
+  // Clean up lyrics: remove timestamps (if synced) and get a snippet
+  let lyrics = data.lyrics
+    .replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "") // remove [mm:ss.xxx] timestamps
+    .replace(/\r?\n\r?\n/g, " ") // replace newlines
+    .trim();
+
+  // Take first ~140 characters for pet speak
+  const snippet = lyrics.length > 140
+    ? lyrics.slice(0, 137).trim() + "..."
+    : lyrics;
+
+  if (snippet) {
+    await ctx.pet.speak(safeText(snippet, "Here are some lyrics for this song!"));
+  } else {
+    await ctx.pet.speak("Sorry, I couldn't find lyrics for this song!");
   }
 }
 

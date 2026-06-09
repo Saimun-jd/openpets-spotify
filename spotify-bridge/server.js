@@ -99,6 +99,24 @@ function httpsPost(url, body, headers) {
   });
 }
 
+async function fetchLyrics(artist, title, album, durationMs) {
+  try {
+    const params = new URLSearchParams({
+      artist_name: artist,
+      track_name: title,
+      album_name: album || "",
+      duration: Math.round(durationMs / 1000)
+    });
+    const url = `https://lrclib.net/api/get?${params.toString()}`;
+    const res = await httpsGet(url);
+    if (res.status !== 200) return null;
+    const data = JSON.parse(res.body);
+    return data.plainLyrics || data.syncedLyrics || null;
+  } catch {
+    return null;
+  }
+}
+
 function httpsPut(url, headers) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
@@ -277,6 +295,28 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, data);
     } catch (err) {
       console.error("[spotify-bridge] /now-playing error:", err.message);
+      sendJson(res, 503, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /lyrics ── get lyrics for current track
+  if (url.pathname === "/lyrics" && req.method === "GET") {
+    try {
+      const nowPlaying = await buildNowPlaying();
+      if (!nowPlaying.playing) {
+        sendJson(res, 200, { lyrics: null, error: "No track playing" });
+        return;
+      }
+      const lyrics = await fetchLyrics(
+        nowPlaying.artist,
+        nowPlaying.title,
+        nowPlaying.album,
+        nowPlaying.durationMs
+      );
+      sendJson(res, 200, { lyrics });
+    } catch (err) {
+      console.error("[spotify-bridge] /lyrics error:", err.message);
       sendJson(res, 503, { error: err.message });
     }
     return;
