@@ -4,6 +4,7 @@ const MIN_POLL_INTERVAL_SECONDS = 1;
 const MAX_ANNOUNCEMENT_LENGTH = 140;
 const EMPTY_TRACK_ID = "__no_track__";
 const UNSAFE_MESSAGE_PATTERN = /```|<script|function\s+\w+|=>|\b(class|import|export|const|let|var)\b|https?:\/\/|www\.|\/[\w.-]+\/[\w./-]+|[A-Za-z]:\\|api[_-]?key|secret|token|password|passwd|BEGIN [A-Z ]+PRIVATE KEY/i;
+const DEFAULT_LYRIC_ADVANCE_MS = 100; // Show lyrics 0.5 seconds early
 
 let pollRunning = false;
 
@@ -117,7 +118,9 @@ async function checkNow(ctx, manual) {
     const currentLyrics = await ctx.storage.get("spotify-lyrics");
     const lastShownLineIndex = Number(await ctx.storage.get("spotify-lastLyricIndex") || -1);
     if (currentLyrics && nowPlaying.progressMs !== undefined) {
-      const currentLineIndex = findLastIndex(currentLyrics, line => line.timestamp <= nowPlaying.progressMs);
+      const lyricAdvanceMs = Number(config.lyricAdvanceMs || DEFAULT_LYRIC_ADVANCE_MS);
+      const adjustedProgress = nowPlaying.progressMs + lyricAdvanceMs;
+      const currentLineIndex = findLastIndex(currentLyrics, line => line.timestamp <= adjustedProgress);
       if (currentLineIndex !== -1 && currentLineIndex !== lastShownLineIndex) {
         await ctx.storage.set("spotify-lastLyricIndex", currentLineIndex);
         const line = currentLyrics[currentLineIndex];

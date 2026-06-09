@@ -21,6 +21,7 @@
     "announceTrackChanges": { "type": "boolean", "label": "Announce track changes", "default": true },
     "reactToMood": { "type": "boolean", "label": "React to track mood", "default": true },
     "reactWhenPaused": { "type": "boolean", "label": "React when paused", "default": true },
-    "announceTemplate": { "type": "text", "label": "Announcement template", "default": "Now playing: {title} by {artist}", "maxLength": 140 }
+    "announceTemplate": { "type": "text", "label": "Announcement template", "default": "Now playing: {title} by {artist}", "maxLength": 140 },
+    "lyricAdvanceMs": { "type": "number", "label": "Lyric advance time (milliseconds)", "default": 500, "min": 0, "max": 3000, "step": 100 }
   }
 }
