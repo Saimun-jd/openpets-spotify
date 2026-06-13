@@ -9,15 +9,15 @@
   "sdkVersion": "1.0.0",
   "entry": "index.js",
   "permissions": ["network", "schedule", "storage", "pet:speak", "pet:reaction", "commands", "status"],
-  "network": { "hosts": ["6b36-103-132-185-215.ngrok-free.app"] },
+  "network": { "hosts": ["spotify-bridge.onrender.com"] },
   "configSchema": {
     "bridgeUrl": {
       "type": "text",
-      "label": "Spotify Bridge URL (ngrok HTTPS)",
-      "default": "https://6b36-103-132-185-215.ngrok-free.app",
-      "description": "Your ngrok HTTPS URL, e.g. https://abc123.ngrok-free.app"
+      "label": "Spotify Bridge URL (HTTPS)",
+      "default": "https://spotify-bridge.onrender.com",
+      "description": "Your Render.com deployment URL"
     },
-    "pollIntervalSeconds": { "type": "number", "label": "Poll interval (seconds)", "default": 2, "min": 1, "max": 300, "step": 1 },
+    "pollIntervalSeconds": { "type": "number", "label": "Poll interval (Seconds)", "default": 1, "min": 1, "max": 5, "step": 1 },
     "announceTrackChanges": { "type": "boolean", "label": "Announce track changes", "default": true },
     "reactToMood": { "type": "boolean", "label": "React to track mood", "default": true },
     "reactWhenPaused": { "type": "boolean", "label": "React when paused", "default": true },

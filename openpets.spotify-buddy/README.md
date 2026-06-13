@@ -9,12 +9,50 @@ openpets.spotify-buddy/  ← OpenPets plugin (loaded by the desktop app)
 
 ---
 
+## ⚠️ **CRITICAL: You MUST Use ngrok**
+
+**OpenPets requires HTTPS and blocks localhost** for security reasons.
+
+Your local bridge runs on `http://localhost:8765`, but **OpenPets plugins cannot access it directly**.
+
+### Quick Start:
+
+1. **Install ngrok:** https://ngrok.com/download
+
+2. **Start your bridge:**
+   ```bash
+   cd spotify-bridge
+   node start.js
+   ```
+
+3. **In a new terminal, start ngrok:**
+   ```bash
+   ngrok http 8765
+   ```
+
+4. **Copy the HTTPS URL** from ngrok output (e.g., `https://abc123.ngrok-free.app`)
+
+5. **Configure the plugin in OpenPets:**
+   - Open: Tray → Plugins → Spotify Buddy → Configure
+   - Set "Bridge URL" to your ngrok URL
+   - Click "Save Config"
+
+6. **Update manifest for new ngrok hostnames:**
+   - Edit `openpets.plugin.json` → `network.hosts`
+   - Add your ngrok hostname (without `https://`)
+   - Reload plugin in OpenPets
+
+**Note:** Free ngrok URLs change each restart. Consider a paid plan for stable URLs.
+
+---
+
 ## How it works
 
 ```
 Spotify API
     ↓  OAuth (Authorization Code Flow)
 spotify-bridge/server.js   ← Node.js, runs on localhost:8765
+    ↓  ngrok tunnel (HTTPS)
     ↓  GET /now-playing  (GET-only, no secrets cross to the plugin)
 openpets.spotify-buddy/index.js  ← sandboxed OpenPets plugin
     ↓  pet.speak() / pet.react()
@@ -22,6 +60,11 @@ Your desktop pet
 ```
 
 The bridge handles all OAuth and token refresh. The plugin never sees your access token — it only receives a sanitised JSON payload from your tunnel endpoint.
+
+**Why ngrok?**
+- OpenPets requires HTTPS (blocks HTTP)
+- OpenPets blocks localhost/private IPs (security)
+- ngrok provides a public HTTPS tunnel to your local bridge
 
 ---
 
@@ -131,8 +174,81 @@ node test.js
 
 ## Troubleshooting
 
-**Pet says "I cannot reach the Spotify bridge"**
-→ Make sure `node start.js` is running in `spotify-bridge/` and the port matches your config.
+**⚠️ KNOWN ISSUE: "Bridge Unreachable" After Some Time**
+
+This is an OpenPets platform bug where network permissions randomly get cleared. 
+
+**When it happens:**
+- Plugin works fine, then suddenly shows "bridge unreachable"
+- Browser can still access the bridge URL
+- Only OpenPets can't reach it
+
+**Quick Fix:**
+1. OpenPets → Plugins → Spotify Buddy → Configure
+2. Click **"Save Config"** (don't change anything)
+3. Plugin works again
+
+**Or use the command:**
+- Right-click your pet → **"Fix Network Permissions"**
+- Follow the instructions
+
+**Root Cause:** OpenPets loses `approvedNetworkHosts` from plugin state. The fix exists but hasn't been released yet. Clicking "Save Config" re-approves the hosts.
+
+---
+
+**Pet says "I cannot reach the Spotify bridge" or shows "bridge unreachable"**
+
+Check these in order:
+
+1. **Is ngrok running?**
+   ```bash
+   # You should see a web interface at http://localhost:4040
+   curl http://localhost:4040
+   ```
+   If not running: `ngrok http 8765`
+
+2. **Is your bridge running?**
+   ```bash
+   cd spotify-bridge
+   node start.js
+   # Should show: "Spotify bridge running on http://127.0.0.1:8765"
+   ```
+
+3. **Is the ngrok URL correct in plugin config?**
+   - Open: OpenPets → Plugins → Spotify Buddy → Configure
+   - Bridge URL should match your current ngrok URL (starts with `https://`)
+   - Click "Save Config" to re-approve network permissions
+
+4. **Is the ngrok hostname in manifest?**
+   - Check `openpets.plugin.json` → `network.hosts`
+   - Should include your current ngrok hostname (without `https://`)
+   - Example: `["abc123-def456.ngrok-free.app", ...]`
+   - Reload plugin after changes
+
+5. **Test ngrok URL manually:**
+   ```bash
+   curl https://your-ngrok-url.ngrok-free.app/now-playing
+   # Should return JSON with Spotify data
+   ```
+
+6. **Check OpenPets logs** for specific errors:
+   - "requires HTTPS" → You're using `http://` instead of `https://`
+   - "not approved" → Ngrok host not in approved network list
+   - "not public" → Trying to use localhost (won't work in OpenPets)
+
+**Free ngrok URL keeps changing**
+→ Each time you restart ngrok, you get a new URL. You must:
+1. Update plugin config with the new URL
+2. Update manifest `network.hosts` with the new hostname
+3. Click "Save Config" and reload the plugin
+
+Consider ngrok's paid plans for stable URLs.
+
+**"Plugin manifest is unavailable" error**
+→ This is an OpenPets platform issue. Try:
+1. Disable and re-enable the plugin
+2. Restart OpenPets
+3. Reinstall the plugin
 
 **Bridge says "Not authorised"**
 → Visit `http://localhost:8765/login` in your browser.

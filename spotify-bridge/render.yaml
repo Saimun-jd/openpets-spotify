@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: spotify-bridge
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /status
+    envVars:
+      - key: NODE_ENV
+        value: production

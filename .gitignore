@@ -1,17 +1,66 @@
-# Dependencies
+# Node.js
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Secrets
+# Environment and secrets
 .env
-spotify-bridge/.env
-spotify-bridge/.tokens.json
+.env.*
+*.env
+secrets.json
+.tokens.json
+tokens.json
 
-# Test files
-test-*.js
-test-*.mjs
-test-*.cjs
-get-ngrok-url.mjs
-final-test.mjs
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# External OpenPets repo
-openpets-repo/
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Debug and monitoring scripts
+auto-fix-*.ps1
+auto-fix-*.cmd
+start-monitor.cmd
+debug-*.md
+*-debug.*
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Archive files
+*.zip
+*.tar.gz
+*.rar
+
+# Runtime and cache
+.cache/
+.npm/
+.yarn/

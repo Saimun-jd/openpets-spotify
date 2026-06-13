@@ -1,0 +1,12 @@
+name: spotify-bridge
+type: web
+ports:
+  - port: 8765
+    protocol: http
+env:
+  - key: PORT
+    value: "8765"
+healthcheck:
+  http:
+    path: /status
+    port: 8765

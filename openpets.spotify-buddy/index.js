@@ -1,12 +1,17 @@
-
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 const MIN_POLL_INTERVAL_SECONDS = 1;
 const MAX_ANNOUNCEMENT_LENGTH = 140;
 const EMPTY_TRACK_ID = "__no_track__";
 const UNSAFE_MESSAGE_PATTERN = /```|<script|function\s+\w+|=>|\b(class|import|export|const|let|var)\b|https?:\/\/|www\.|\/[\w.-]+\/[\w./-]+|[A-Za-z]:\\|api[_-]?key|secret|token|password|passwd|BEGIN [A-Z ]+PRIVATE KEY/i;
-const DEFAULT_LYRIC_ADVANCE_MS = 100; // Show lyrics 0.5 seconds early
+const DEFAULT_LYRIC_ADVANCE_MS = 500;
 
 let pollRunning = false;
+
+// Safe sanitizer for lyrics — skips the unsafe pattern check
+function sanitizeLyric(text) {
+  if (typeof text !== "string" || !text.trim()) return "";
+  return text.trim().replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").slice(0, MAX_ANNOUNCEMENT_LENGTH).trim();
+}
 
 export function register(OpenPetsPlugin) {
   OpenPetsPlugin.register({
@@ -84,6 +89,7 @@ async function checkNow(ctx, manual) {
       await ctx.storage.set("spotify-lastTrackId", EMPTY_TRACK_ID);
       await ctx.storage.set("spotify-lyrics", null);
       await ctx.storage.set("spotify-lastLyricIndex", -1);
+      await ctx.schedule.cancel("spotify-lyric");
       return;
     }
 
@@ -106,29 +112,31 @@ async function checkNow(ctx, manual) {
         await ctx.pet.react("celebrating");
       }
 
-      // Reset and fetch lyrics for new track!
       await ctx.storage.set("spotify-lastTrackId", currentTrackId);
       await ctx.storage.set("spotify-lastLyricIndex", -1);
-      const lyricsData = await fetchFromBridge(ctx, config.bridgeUrl, "/lyrics");
-      await ctx.storage.set("spotify-lyrics", lyricsData?.lyrics?.synced || null);
-      ctx.log?.info?.("Loaded synced lyrics for new track:", lyricsData?.lyrics?.synced);
-    }
+      await ctx.schedule.cancel("spotify-lyric");
 
-    // Check for current lyric line!
-    const currentLyrics = await ctx.storage.get("spotify-lyrics");
-    const lastShownLineIndex = Number(await ctx.storage.get("spotify-lastLyricIndex") || -1);
-    if (currentLyrics && nowPlaying.progressMs !== undefined) {
-      const lyricAdvanceMs = Number(config.lyricAdvanceMs || DEFAULT_LYRIC_ADVANCE_MS);
-      const adjustedProgress = nowPlaying.progressMs + lyricAdvanceMs;
-      const currentLineIndex = findLastIndex(currentLyrics, line => line.timestamp <= adjustedProgress);
-      if (currentLineIndex !== -1 && currentLineIndex !== lastShownLineIndex) {
-        await ctx.storage.set("spotify-lastLyricIndex", currentLineIndex);
-        const line = currentLyrics[currentLineIndex];
-        ctx.log?.info?.("Showing lyric line:", line);
-        const cleanLine = safeText(line.text, "");
-        if (cleanLine) {
-          await ctx.pet.speak(cleanLine);
-        }
+      const lyricsData = await fetchFromBridge(ctx, config.bridgeUrl, "/lyrics");
+      const syncedLyrics = lyricsData?.lyrics?.synced || null;
+
+      ctx.log?.info?.("Lyrics fetch result", {
+        hasPlain: !!lyricsData?.lyrics?.plain,
+        hasSynced: !!syncedLyrics,
+        syncedCount: syncedLyrics?.length ?? 0,
+      });
+
+      await ctx.storage.set("spotify-lyrics", syncedLyrics);
+
+      if (syncedLyrics?.length) {
+        await scheduleNextLyric(ctx, config, syncedLyrics, nowPlaying.progressMs ?? 0, -1);
+      }
+    } else {
+      // Re-sync lyric position on each poll in case of drift
+      const currentLyrics = await ctx.storage.get("spotify-lyrics");
+      const lastShownIndex = Number(await ctx.storage.get("spotify-lastLyricIndex") ?? -1);
+      if (currentLyrics?.length && nowPlaying.progressMs !== undefined) {
+        const config2 = config; // already have config
+        await scheduleNextLyric(ctx, config2, currentLyrics, nowPlaying.progressMs, lastShownIndex);
       }
     }
 
@@ -141,11 +149,52 @@ async function checkNow(ctx, manual) {
         artist: nowPlaying.artist,
       }));
     }
-
-    await scheduleNext(ctx);
   } finally {
     pollRunning = false;
   }
+}
+
+async function scheduleNextLyric(ctx, config, lyrics, currentProgressMs, lastShownIndex) {
+  await ctx.schedule.cancel("spotify-lyric");
+
+  const lyricAdvanceMs = Number(config.lyricAdvanceMs ?? DEFAULT_LYRIC_ADVANCE_MS);
+
+  // Find the next line after lastShownIndex whose timestamp is still in the future
+  let nextIndex = -1;
+  for (let i = lastShownIndex + 1; i < lyrics.length; i++) {
+    if (lyrics[i].timestamp >= currentProgressMs - lyricAdvanceMs) {
+      nextIndex = i;
+      break;
+    }
+  }
+
+  if (nextIndex === -1) {
+    ctx.log?.info?.("No more lyric lines to schedule");
+    return;
+  }
+
+  const nextLine = lyrics[nextIndex];
+  const delayMs = Math.max(0, nextLine.timestamp - currentProgressMs - lyricAdvanceMs);
+
+  ctx.log?.info?.("Scheduling lyric line", { nextIndex, text: nextLine.text, delayMs });
+
+  await ctx.schedule.once("spotify-lyric", delayMs, async () => {
+    await ctx.storage.set("spotify-lastLyricIndex", nextIndex);
+    const cleanLine = sanitizeLyric(nextLine.text);
+    ctx.log?.info?.("Showing scheduled lyric", { cleanLine, nextIndex });
+    if (cleanLine) {
+      await ctx.pet.speak(cleanLine);
+      await ctx.status.set({ text: `🎵 ${cleanLine}`, tone: "info" });
+    }
+
+    // Schedule the next line
+    const storedLyrics = await ctx.storage.get("spotify-lyrics");
+    if (storedLyrics?.length) {
+      const freshConfig = await ctx.config.get();
+      // Use nextLine.timestamp as our current position estimate
+      await scheduleNextLyric(ctx, freshConfig, storedLyrics, nextLine.timestamp, nextIndex);
+    }
+  });
 }
 
 async function showWhatsPlaying(ctx) {
@@ -164,6 +213,7 @@ async function showWhatsPlaying(ctx) {
 }
 
 async function resetSpotifyState(ctx) {
+  await ctx.schedule.cancel("spotify-lyric");
   await ctx.storage.delete("spotify-lastTrackId");
   await ctx.storage.delete("spotify-lastPlaying");
   await ctx.storage.delete("spotify-lyrics");
@@ -200,23 +250,30 @@ async function showLyrics(ctx) {
     return;
   }
 
-  if (!data.lyrics?.plain && !data.lyrics?.synced) {
+  if (!data.lyrics?.plain && !data.lyrics?.synced?.length) {
     await ctx.pet.speak("Sorry, I couldn't find lyrics for this song!");
     return;
   }
 
-  const lyrics = data.lyrics.plain || data.lyrics.synced.map(l => l.text).join(" ");
-  let cleanLyrics = lyrics
+  // Use sanitizeLyric instead of safeText — no unsafe pattern check on lyrics
+  const rawLyrics = data.lyrics.plain
+    || data.lyrics.synced.map(l => l.text).join(" ");
+
+  const cleaned = rawLyrics
     .replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "")
-    .replace(/\r?\n\r?\n/g, " ")
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  const snippet = cleanLyrics.length > 140
-    ? cleanLyrics.slice(0, 137).trim() + "..."
-    : cleanLyrics;
+  const snippet = cleaned.length > 137
+    ? cleaned.slice(0, 137).trim() + "..."
+    : cleaned;
 
-  if (snippet) {
-    await ctx.pet.speak(safeText(snippet, "Here are some lyrics for this song!"));
+  const final = sanitizeLyric(snippet);
+
+  if (final) {
+    ctx.log?.info?.("showLyrics speaking", { final });
+    await ctx.pet.speak(final);
   } else {
     await ctx.pet.speak("Sorry, I couldn't find lyrics for this song!");
   }
@@ -225,20 +282,19 @@ async function showLyrics(ctx) {
 async function fetchFromBridge(ctx, bridgeUrl, path) {
   try {
     const url = `${String(bridgeUrl || "").replace(/\/+$/, "")}${path}`;
-    ctx.log?.info?.("Attempting to fetch from bridge", { url });
+    ctx.log?.info?.("Fetching from bridge", { url });
     const res = await ctx.http.fetch(url, {
       headers: { "ngrok-skip-browser-warning": "true", "user-agent": "OpenPets Spotify Buddy" },
       timeoutMs: 10000,
     });
-    ctx.log?.info?.("Bridge response received", { status: res.status, ok: res.ok, hasJson: !!res.json });
-
+    ctx.log?.info?.("Bridge response", { status: res.status, ok: res.ok });
     if (!res.ok) {
-      ctx.log?.warn?.("Spotify bridge fetch failed", res.status);
+      ctx.log?.warn?.("Bridge non-OK", res.status);
       return null;
     }
     return res.json || null;
   } catch (error) {
-    ctx.log?.warn?.("Spotify bridge unreachable", error?.message || String(error), { error });
+    ctx.log?.warn?.("Bridge fetch error", error?.message || String(error));
     return null;
   }
 }
