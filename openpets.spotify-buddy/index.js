@@ -1,3 +1,9 @@
+// Spotify Buddy — OpenPets Plugin (manifestVersion 2, sdkVersion 1.0.0)
+//
+// IMPORTANT: The OpenPets plugin sandbox only supports ctx.http.fetch with
+// method: "GET". There is no POST capability. All playback control endpoints
+// on your bridge (/pause, /play, /next, /previous) must accept GET requests.
+
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 const MIN_POLL_INTERVAL_SECONDS = 2;
 const MAX_ANNOUNCEMENT_LENGTH = 140;
@@ -67,7 +73,6 @@ async function scheduleLyrics(ctx, lyrics, progressMs) {
     const delay = line.timestamp - progressMs - SPEAK_LATENCY_MS;
     if (delay < -200) continue;
 
-    // Bubble stays up until the next non-empty line is due
     let durationMs = MIN_BUBBLE_MS;
     for (let j = i + 1; j < lyrics.length; j++) {
       if (sanitizeLyric(lyrics[j].text)) {
@@ -105,34 +110,27 @@ function seekDriftDetected(nowProgressMs) {
   return Math.abs(expectedProgress - nowProgressMs) > SEEK_DRIFT_THRESHOLD_MS;
 }
 
-// ─── Bridge fetch helpers ─────────────────────────────────────────────────────
+// ─── Bridge fetch ─────────────────────────────────────────────────────────────
+//
+// ctx.http.fetch is the ONLY network method available to plugins.
+// It is GET-only and HTTPS-only by SDK design — there is no POST support.
+//
+// This single helper is used for both read endpoints (/now-playing, /lyrics)
+// AND control endpoints (/pause, /play, /next, /previous).
+//
+// !! Your bridge server MUST accept GET requests on all control endpoints. !!
+//
+// Example Express routes to add on your bridge:
+//   app.get('/pause',    (req, res) => { spotifyApi.pause();   res.sendStatus(204); });
+//   app.get('/play',     (req, res) => { spotifyApi.play();    res.sendStatus(204); });
+//   app.get('/next',     (req, res) => { spotifyApi.next();    res.sendStatus(204); });
+//   app.get('/previous', (req, res) => { spotifyApi.previous(); res.sendStatus(204); });
 
-// GET — used for /now-playing and /lyrics (read-only, works with ctx.http)
-async function bridgeGet(ctx, bridgeUrl, path) {
+async function bridgeFetch(ctx, bridgeUrl, path) {
   try {
-    const url = `${String(bridgeUrl || "").replace(/\/+$/, "")}${path}`;
+    const base = String(bridgeUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
     ctx.log?.info?.("GET", { url });
-    const res = await ctx.http.fetch(url, {
-      method: "GET",
-      headers: { "ngrok-skip-browser-warning": "true", "user-agent": "OpenPets Spotify Buddy" },
-      timeoutMs: 10000,
-    });
-    ctx.log?.info?.("Response", { status: res.status, ok: res.ok });
-    if (!res.ok) return null;
-    return res.json || null;
-  } catch (e) {
-    ctx.log?.warn?.("GET error", e?.message || String(e));
-    return null;
-  }
-}
-
-// POST — used for playback controls (requires ctx.net + network:write permission)
-// POST is not available in the plugin SDK (ctx.http is GET-only).
-// Bridge must accept GET requests for control endpoints.
-async function bridgePost(ctx, bridgeUrl, path) {
-  try {
-    const url = `${String(bridgeUrl || "").replace(/\/+$/, "")}${path}`;
-    ctx.log?.info?.("GET (control)", { url });
     const res = await ctx.http.fetch(url, {
       method: "GET",
       headers: {
@@ -142,11 +140,26 @@ async function bridgePost(ctx, bridgeUrl, path) {
       timeoutMs: 10000,
     });
     ctx.log?.info?.("Response", { status: res.status, ok: res.ok });
-    return res.ok || res.status === 204;
+    return res;
   } catch (e) {
-    ctx.log?.warn?.("Control GET error", e?.message || String(e));
-    return false;
+    ctx.log?.warn?.("Fetch error", { path, msg: e?.message || String(e) });
+    return null;
   }
+}
+
+// Convenience: fetch and parse JSON (used for /now-playing and /lyrics)
+async function bridgeGetJson(ctx, bridgeUrl, path) {
+  const res = await bridgeFetch(ctx, bridgeUrl, path);
+  if (!res || !res.ok) return null;
+  return res.json ?? null;
+}
+
+// Convenience: fire a control endpoint and return success bool
+// 204 No Content counts as success (standard Spotify control response)
+async function bridgeControl(ctx, bridgeUrl, path) {
+  const res = await bridgeFetch(ctx, bridgeUrl, path);
+  if (!res) return false;
+  return res.ok || res.status === 204;
 }
 
 // ─── Plugin registration ──────────────────────────────────────────────────────
@@ -233,7 +246,7 @@ async function checkNow(ctx, manual) {
   pollRunning = true;
   try {
     const config = await ctx.config.get();
-    const nowPlaying = await bridgeGet(ctx, config.bridgeUrl, "/now-playing");
+    const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
 
     if (!nowPlaying) {
       await ctx.status.set({ text: "Spotify: bridge unreachable", tone: "warning" });
@@ -271,7 +284,7 @@ async function checkNow(ctx, manual) {
       await ctx.storage.set("spotify-lastTrackId", currentTrackId);
       await ctx.storage.set("spotify-lastLyricIndex", -1);
 
-      const lyricsData = await bridgeGet(ctx, config.bridgeUrl, "/lyrics");
+      const lyricsData = await bridgeGetJson(ctx, config.bridgeUrl, "/lyrics");
       const syncedLyrics = lyricsData?.lyrics?.synced || null;
       ctx.log?.info?.("Lyrics loaded", { count: syncedLyrics?.length ?? 0 });
       await ctx.storage.set("spotify-lyrics", syncedLyrics);
@@ -310,7 +323,7 @@ async function checkNow(ctx, manual) {
 
 async function showWhatsPlaying(ctx) {
   const config = await ctx.config.get();
-  const nowPlaying = await bridgeGet(ctx, config.bridgeUrl, "/now-playing");
+  const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
   if (!nowPlaying?.playing) {
     await ctx.pet.speak("Nothing is playing right now.");
     return;
@@ -321,10 +334,9 @@ async function showWhatsPlaying(ctx) {
   ));
 }
 
-// Toggle: check current state from the bridge, then POST /pause or /play
 async function togglePausePlay(ctx) {
   const config = await ctx.config.get();
-  const nowPlaying = await bridgeGet(ctx, config.bridgeUrl, "/now-playing");
+  const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
 
   if (!nowPlaying) {
     await ctx.pet.speak("Can't reach Spotify bridge.");
@@ -332,9 +344,8 @@ async function togglePausePlay(ctx) {
   }
 
   if (nowPlaying.playing) {
-    // Currently playing → pause it
     await cancelLyricSchedules(ctx);
-    const ok = await bridgePost(ctx, config.bridgeUrl, "/pause");
+    const ok = await bridgeControl(ctx, config.bridgeUrl, "/pause");
     if (ok) {
       await ctx.pet.speak("Paused.");
       await ctx.pet.react("idle");
@@ -343,13 +354,11 @@ async function togglePausePlay(ctx) {
       await ctx.pet.speak("Couldn't pause Spotify.");
     }
   } else {
-    // Currently paused → resume it
-    const ok = await bridgePost(ctx, config.bridgeUrl, "/play");
+    const ok = await bridgeControl(ctx, config.bridgeUrl, "/play");
     if (ok) {
       await ctx.pet.speak("Resuming playback!");
       await ctx.pet.react("celebrating");
       await ctx.status.set({ text: "Spotify: resuming…", tone: "success" });
-      // Give Spotify a moment to resume before re-checking state + re-scheduling lyrics
       await ctx.schedule.once("spotify-resume-check", 1200, async () => {
         await checkNow(ctx, false);
       });
@@ -359,20 +368,18 @@ async function togglePausePlay(ctx) {
   }
 }
 
-// Skip next / previous — cancel lyric schedules then POST to bridge
 async function controlPlayback(ctx, path, message) {
   const config = await ctx.config.get();
   await cancelLyricSchedules(ctx);
-  const ok = await bridgePost(ctx, config.bridgeUrl, path);
+  const ok = await bridgeControl(ctx, config.bridgeUrl, path);
   if (ok) {
     await ctx.pet.speak(message);
-    // Brief delay so Spotify has time to update the current track before we poll
     await ctx.schedule.once("spotify-skip-check", 800, async () => {
       await checkNow(ctx, false);
     });
   } else {
     await ctx.pet.speak("Playback control failed. Check your bridge.");
-    ctx.log?.warn?.("bridgePost failed", { path });
+    ctx.log?.warn?.("bridgeControl failed", { path });
   }
 }
 
@@ -390,13 +397,13 @@ async function resetSpotifyState(ctx) {
 async function showLyrics(ctx) {
   try {
     const config = await ctx.config.get();
-    const testData = await bridgeGet(ctx, config.bridgeUrl, "/now-playing");
+    const testData = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
     if (!testData) {
       await ctx.pet.speak("Can't reach Spotify bridge.");
       return;
     }
 
-    const data = await bridgeGet(ctx, config.bridgeUrl, "/lyrics");
+    const data = await bridgeGetJson(ctx, config.bridgeUrl, "/lyrics");
     if (!data) {
       await ctx.pet.speak("Lyrics endpoint not responding.");
       return;
@@ -431,6 +438,7 @@ async function showLyrics(ctx) {
     const snippet = cleaned.length > 137 ? cleaned.slice(0, 137).trim() + "..." : cleaned;
     const final = snippet.replace(/[`'"<>]/g, "").trim();
     await ctx.pet.speak(final || "Lyrics couldn't be displayed.");
+    
   } catch (error) {
     ctx.log?.error?.("showLyrics error:", error);
     await ctx.pet.speak("Error getting lyrics: " + (error?.message || "unknown"));

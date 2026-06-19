@@ -3,7 +3,7 @@
   "id": "openpets.spotify-buddy",
   "name": "Spotify Buddy",
   "description": "Your pet reacts to Spotify, syncs lyrics in real time, and controls playback.",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "runtime": "javascript",
   "icon": "sparkles",
   "sdkVersion": "1.0.0",

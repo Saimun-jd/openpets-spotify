@@ -3,11 +3,16 @@
  *
  * A local OAuth bridge for the OpenPets Spotify Buddy plugin.
  * Handles the Spotify Authorization Code Flow, stores tokens in a local
- * JSON file, auto-refreshes before expiry, and exposes one endpoint:
+ * JSON file, auto-refreshes before expiry, and exposes endpoints:
  *
  *   GET http://127.0.0.1:PORT/now-playing
+ *   GET http://127.0.0.1:PORT/lyrics
+ *   GET http://127.0.0.1:PORT/pause
+ *   GET http://127.0.0.1:PORT/play
+ *   GET http://127.0.0.1:PORT/next
+ *   GET http://127.0.0.1:PORT/previous
  *
- * The OpenPets plugin polls this endpoint — it never touches OAuth directly.
+ * The OpenPets plugin polls/calls these endpoints — it never touches OAuth directly.
  *
  * Setup:
  *   1. Create a Spotify app at https://developer.spotify.com/dashboard
@@ -31,19 +36,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? process.env.SPOTIFY_BRIDGE_PORT ?? 8765);
 const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID ?? "";
 const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET ?? "";
-const BASE_URL = process.env.RENDER_EXTERNAL_URL 
-  ? process.env.RENDER_EXTERNAL_URL 
-  : (process.env.RAILWAY_PUBLIC_DOMAIN 
-    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
-    : `http://127.0.0.1:${PORT}`);
+const BASE_URL = process.env.RENDER_EXTERNAL_URL
+  ? process.env.RENDER_EXTERNAL_URL
+  : process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `http://127.0.0.1:${PORT}`;
 const REDIRECT_URI = `${BASE_URL}/callback`;
-const SCOPES = "user-read-currently-playing user-read-playback-state user-read-recently-played user-modify-playback-state";
+const SCOPES =
+  "user-read-currently-playing user-read-playback-state user-read-recently-played user-modify-playback-state";
 const TOKEN_FILE = path.join(__dirname, ".tokens.json");
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error(
     "[spotify-bridge] ERROR: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set.\n" +
-    "Copy .env.example to .env and fill in your Spotify app credentials."
+      "Copy .env.example to .env and fill in your Spotify app credentials."
   );
   process.exit(1);
 }
@@ -76,7 +82,10 @@ function httpsGet(url, headers) {
       res.on("end", () => resolve({ status: res.statusCode, body }));
     });
     req.on("error", reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error("Request timed out")); });
+    req.setTimeout(8000, () => {
+      req.destroy();
+      reject(new Error("Request timed out"));
+    });
   });
 }
 
@@ -89,7 +98,11 @@ function httpsPost(url, body, headers) {
         hostname: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": data.length, ...headers },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": data.length,
+          ...headers,
+        },
       },
       (res) => {
         let responseBody = "";
@@ -98,8 +111,40 @@ function httpsPost(url, body, headers) {
       }
     );
     req.on("error", reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error("Request timed out")); });
+    req.setTimeout(8000, () => {
+      req.destroy();
+      reject(new Error("Request timed out"));
+    });
     req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * Generic helper for Spotify Web API calls that require PUT or POST
+ * with no request body (pause, play, next, previous).
+ */
+function spotifyControl(url, method, headers) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const req = https.request(
+      {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method, // "PUT" or "POST" as required by the Spotify API
+        headers: { "Content-Length": 0, ...headers },
+      },
+      (res) => {
+        let responseBody = "";
+        res.on("data", (chunk) => (responseBody += chunk));
+        res.on("end", () => resolve({ status: res.statusCode, body: responseBody }));
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(8000, () => {
+      req.destroy();
+      reject(new Error("Request timed out"));
+    });
     req.end();
   });
 }
@@ -107,7 +152,10 @@ function httpsPost(url, body, headers) {
 function cleanTrackName(name) {
   if (!name) return name;
   return name
-    .replace(/\s*(?:-\s*)?(?:Remaster(?:ed)?|Live|From.*?Session|Edit|Version|Mix|Acoustic|Instrumental|Radio Edit)(?:\s*\d{4})?\s*$/i, "")
+    .replace(
+      /\s*(?:-\s*)?(?:Remaster(?:ed)?|Live|From.*?Session|Edit|Version|Mix|Acoustic|Instrumental|Radio Edit)(?:\s*\d{4})?\s*$/i,
+      ""
+    )
     .replace(/\s*\([^)]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^)]*\)/gi, "")
     .replace(/\s*\[[^\]]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^\]]*\]/gi, "")
     .trim();
@@ -120,7 +168,7 @@ async function tryLrclibSearch(artist, title, album, durationMs) {
     if (title) params.set("track_name", title);
     if (album) params.set("album_name", album);
     if (durationMs) params.set("duration", Math.round(durationMs / 1000));
-    
+
     const url = `https://lrclib.net/api/get?${params.toString()}`;
     console.log(`Trying LRCLIB: ${url}`);
     const res = await httpsGet(url);
@@ -133,16 +181,16 @@ async function tryLrclibSearch(artist, title, album, durationMs) {
 
 async function fetchLyrics(artist, title, album, durationMs) {
   try {
-    // Clean the names first
     const cleanedArtist = artist?.trim();
     const cleanedTitle = cleanTrackName(title);
     const cleanedAlbum = album?.trim();
 
-    console.log(`Searching lyrics for: ${cleanedArtist} - ${cleanedTitle} (${cleanedAlbum || 'no album'})`);
+    console.log(
+      `Searching lyrics for: ${cleanedArtist} - ${cleanedTitle} (${cleanedAlbum || "no album"})`
+    );
 
-    // Try multiple search strategies in order
     let data = null;
-    
+
     // 1. Try with all cleaned params first
     data = await tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, durationMs);
     if (data && (data.syncedLyrics || data.plainLyrics)) {
@@ -193,7 +241,7 @@ async function fetchLyrics(artist, title, album, durationMs) {
 
     return {
       plain: data.plainLyrics || null,
-      synced: syncedLines.length > 0 ? syncedLines : null
+      synced: syncedLines.length > 0 ? syncedLines : null,
     };
   } catch (e) {
     console.error("Error in fetchLyrics:", e);
@@ -201,39 +249,59 @@ async function fetchLyrics(artist, title, album, durationMs) {
   }
 }
 
-function httpsPut(url, headers) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const req = https.request(
-      {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: "POST", // Spotify uses POST for playback controls!
-        headers: { ...headers },
-      },
-      (res) => {
-        let responseBody = "";
-        res.on("data", (chunk) => (responseBody += chunk));
-        res.on("end", () => resolve({ status: res.statusCode, body: responseBody }));
-      }
-    );
-    req.on("error", reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error("Request timed out")); });
-    req.end();
-  });
+// ─── Playback control helpers ─────────────────────────────────────────────────
+
+async function pausePlayback() {
+  const accessToken = await getValidAccessToken();
+  // Spotify: PUT /v1/me/player/pause — 204 on success
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/pause",
+    "PUT",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  // 204 = paused, 403 = already paused (treat as ok)
+  if (res.status !== 204 && res.status !== 403) {
+    throw new Error(`Failed to pause: ${res.status} ${res.body}`);
+  }
+}
+
+async function resumePlayback() {
+  const accessToken = await getValidAccessToken();
+  // Spotify: PUT /v1/me/player/play — 204 on success
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/play",
+    "PUT",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  // 204 = resumed, 403 = already playing (treat as ok)
+  if (res.status !== 204 && res.status !== 403) {
+    throw new Error(`Failed to resume: ${res.status} ${res.body}`);
+  }
 }
 
 async function skipToNext() {
   const accessToken = await getValidAccessToken();
-  const res = await httpsPut("https://api.spotify.com/v1/me/player/next", { Authorization: `Bearer ${accessToken}` });
+  // Spotify: POST /v1/me/player/next — 204 on success
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/next",
+    "POST",
+    { Authorization: `Bearer ${accessToken}` }
+  );
   if (res.status !== 204) throw new Error(`Failed to skip: ${res.status}`);
 }
 
 async function skipToPrevious() {
   const accessToken = await getValidAccessToken();
-  const res = await httpsPut("https://api.spotify.com/v1/me/player/previous", { Authorization: `Bearer ${accessToken}` });
+  // Spotify: POST /v1/me/player/previous — 204 on success
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/previous",
+    "POST",
+    { Authorization: `Bearer ${accessToken}` }
+  );
   if (res.status !== 204) throw new Error(`Failed to go back: ${res.status}`);
 }
+
+// ─── Token management ─────────────────────────────────────────────────────────
 
 async function refreshAccessToken() {
   if (!tokens?.refresh_token) throw new Error("No refresh token stored. Visit /login first.");
@@ -244,7 +312,10 @@ async function refreshAccessToken() {
       grant_type: "refresh_token",
       refresh_token: tokens.refresh_token,
     }).toString(),
-    { Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") }
+    {
+      Authorization:
+        "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+    }
   );
 
   if (res.status !== 200) throw new Error(`Token refresh failed: ${res.status} ${res.body}`);
@@ -252,7 +323,7 @@ async function refreshAccessToken() {
   const data = JSON.parse(res.body);
   tokens = {
     access_token: data.access_token,
-    refresh_token: data.refresh_token ?? tokens.refresh_token, // Spotify may or may not rotate it
+    refresh_token: data.refresh_token ?? tokens.refresh_token,
     expires_at: Date.now() + data.expires_in * 1000 - 30_000, // 30s safety margin
   };
   saveTokens(tokens);
@@ -261,9 +332,10 @@ async function refreshAccessToken() {
 
 async function getValidAccessToken() {
   if (!tokens) {
-    const loginUrl = BASE_URL.includes('railway') || BASE_URL.includes('render') 
-      ? `${BASE_URL}/login` 
-      : `http://127.0.0.1:${PORT}/login`;
+    const loginUrl =
+      BASE_URL.includes("railway") || BASE_URL.includes("render")
+        ? `${BASE_URL}/login`
+        : `http://127.0.0.1:${PORT}/login`;
     throw new Error("Not authorised. Visit " + loginUrl);
   }
   if (Date.now() >= tokens.expires_at) await refreshAccessToken();
@@ -272,16 +344,11 @@ async function getValidAccessToken() {
 
 // ─── Spotify data fetchers ────────────────────────────────────────────────────
 
-/**
- * Fetch audio features for a track (tempo, energy, valence, danceability).
- * Returns null if the call fails — plugin degrades gracefully.
- */
 async function fetchAudioFeatures(trackId, accessToken) {
   try {
-    const res = await httpsGet(
-      `https://api.spotify.com/v1/audio-features/${trackId}`,
-      { Authorization: `Bearer ${accessToken}` }
-    );
+    const res = await httpsGet(`https://api.spotify.com/v1/audio-features/${trackId}`, {
+      Authorization: `Bearer ${accessToken}`,
+    });
     if (res.status !== 200) return null;
     return JSON.parse(res.body);
   } catch {
@@ -289,11 +356,6 @@ async function fetchAudioFeatures(trackId, accessToken) {
   }
 }
 
-/**
- * Main endpoint data builder.
- * Returns a plain JSON object that is safe to expose over localhost.
- * NO access token, NO secrets ever leave this process.
- */
 async function buildNowPlaying() {
   const accessToken = await getValidAccessToken();
 
@@ -302,7 +364,6 @@ async function buildNowPlaying() {
     { Authorization: `Bearer ${accessToken}` }
   );
 
-  // 204 = nothing playing, 200 = playing
   if (res.status === 204 || !res.body) {
     return { playing: false };
   }
@@ -318,7 +379,6 @@ async function buildNowPlaying() {
 
   const data = JSON.parse(res.body);
 
-  // Only handle tracks (not podcasts/episodes)
   if (data.currently_playing_type !== "track" || !data.item) {
     return { playing: false };
   }
@@ -332,7 +392,6 @@ async function buildNowPlaying() {
   const durationMs = track.duration_ms ?? 0;
   const isPlaying = data.is_playing === true;
 
-  // Fetch audio features in parallel — non-blocking
   const features = trackId ? await fetchAudioFeatures(trackId, accessToken) : null;
 
   return {
@@ -343,15 +402,14 @@ async function buildNowPlaying() {
     album,
     progressMs,
     durationMs,
-    // Audio features for mood mapping (all 0-1 unless noted)
     features: features
       ? {
-          tempo: features.tempo,         // BPM, typically 60-200
-          energy: features.energy,       // 0-1, intensity/activity
-          valence: features.valence,     // 0-1, musical positiveness
-          danceability: features.danceability, // 0-1
-          acousticness: features.acousticness, // 0-1
-          instrumentalness: features.instrumentalness, // 0-1
+          tempo: features.tempo,
+          energy: features.energy,
+          valence: features.valence,
+          danceability: features.danceability,
+          acousticness: features.acousticness,
+          instrumentalness: features.instrumentalness,
         }
       : null,
   };
@@ -363,7 +421,7 @@ function sendJson(res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*", // localhost only — fine
+    "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store",
   });
   res.end(body);
@@ -411,7 +469,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /next ── skip to next track (supports both for plugin SDK compatibility)
+  // ── GET /pause ── pause playback
+  // Accepts GET so the OpenPets plugin SDK (GET-only) can call it.
+  if (url.pathname === "/pause" && (req.method === "GET" || req.method === "POST")) {
+    try {
+      await pausePlayback();
+      sendJson(res, 200, { ok: true });
+    } catch (err) {
+      console.error("[spotify-bridge] /pause error:", err.message);
+      sendJson(res, 503, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /play ── resume playback
+  // Accepts GET so the OpenPets plugin SDK (GET-only) can call it.
+  if (url.pathname === "/play" && (req.method === "GET" || req.method === "POST")) {
+    try {
+      await resumePlayback();
+      sendJson(res, 200, { ok: true });
+    } catch (err) {
+      console.error("[spotify-bridge] /play error:", err.message);
+      sendJson(res, 503, { error: err.message });
+    }
+    return;
+  }
+
+  // ── GET /next ── skip to next track
   if (url.pathname === "/next" && (req.method === "GET" || req.method === "POST")) {
     try {
       await skipToNext();
@@ -490,10 +574,14 @@ const server = http.createServer(async (req, res) => {
           code,
           redirect_uri: REDIRECT_URI,
         }).toString(),
-        { Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") }
+        {
+          Authorization:
+            "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+        }
       );
 
-      if (tokenRes.status !== 200) throw new Error(`Token exchange failed: ${tokenRes.status}`);
+      if (tokenRes.status !== 200)
+        throw new Error(`Token exchange failed: ${tokenRes.status}`);
 
       const data = JSON.parse(tokenRes.body);
       tokens = {
@@ -534,50 +622,59 @@ server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.error(
       `[spotify-bridge] ERROR: Port ${PORT} is already in use.\n` +
-      `Stop the existing bridge process or set SPOTIFY_BRIDGE_PORT to a free port.`
+        `Stop the existing bridge process or set SPOTIFY_BRIDGE_PORT to a free port.`
     );
     process.exit(1);
   }
-
   console.error("[spotify-bridge] Server error:", err);
   process.exit(1);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  const isCloud = BASE_URL.includes('railway') || BASE_URL.includes('render');
+  const isCloud =
+    BASE_URL.includes("railway") || BASE_URL.includes("render");
   console.log(`[spotify-bridge] Listening on ${BASE_URL}`);
-  
+
   if (!tokens) {
-    console.log(`[spotify-bridge] Not authorised. Visit ${BASE_URL}/login to connect Spotify`);
+    console.log(
+      `[spotify-bridge] Not authorised. Visit ${BASE_URL}/login to connect Spotify`
+    );
     if (!isCloud) {
       openBrowser(`http://127.0.0.1:${PORT}/login`);
     }
   } else {
     console.log("[spotify-bridge] Tokens loaded from disk. Bridge is ready.");
   }
-  
+
   // Keep-alive ping for Render.com (prevents spin down)
-  if (BASE_URL.includes('render')) {
-    console.log('[keep-alive] Starting keep-alive pings every 10 minutes');
+  if (BASE_URL.includes("render")) {
+    console.log("[keep-alive] Starting keep-alive pings every 10 minutes");
     setInterval(() => {
-      https.get(`${BASE_URL}/status`, (res) => {
-        console.log(`[keep-alive] Pinged /status - Status: ${res.statusCode}`);
-      }).on('error', (err) => {
-        console.log('[keep-alive] Ping failed:', err.message);
-      });
-    }, 10 * 60 * 1000); // Every 10 minutes (increased frequency)
+      https
+        .get(`${BASE_URL}/status`, (res) => {
+          console.log(`[keep-alive] Pinged /status - Status: ${res.statusCode}`);
+        })
+        .on("error", (err) => {
+          console.log("[keep-alive] Ping failed:", err.message);
+        });
+    }, 10 * 60 * 1000);
   }
 });
 
 function openBrowser(url) {
   const { platform } = process;
   const cmd =
-    platform === "win32" ? `start "" "${url}"` :
-    platform === "darwin" ? `open "${url}"` :
-    `xdg-open "${url}"`;
+    platform === "win32"
+      ? `start "" "${url}"`
+      : platform === "darwin"
+        ? `open "${url}"`
+        : `xdg-open "${url}"`;
   import("node:child_process").then(({ exec }) => {
     exec(cmd, (err) => {
-      if (err) console.log(`[spotify-bridge] Could not auto-open browser. Please visit manually: ${url}`);
+      if (err)
+        console.log(
+          `[spotify-bridge] Could not auto-open browser. Please visit manually: ${url}`
+        );
     });
   });
 }
