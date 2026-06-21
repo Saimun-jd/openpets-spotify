@@ -289,10 +289,25 @@ async function spotifyFetch(ctx, path, method = "GET", body = null) {
 
 async function getLRCLIBLyrics(ctx, trackName, artistName, durationMs) {
   try {
+    // 1. Try precise match
     const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${Math.round(durationMs / 1000)}`;
-    const res = await ctx.net.fetch(url, { method: "GET" });
-    if (res.ok && res.json) {
-      return res.json;
+    let res = await ctx.net.fetch(url, { method: "GET" });
+    if (!res.json && res.text) {
+      try { res.json = JSON.parse(res.text); } catch (e) {}
+    }
+    if (res.ok && res.json) return res.json;
+
+    // 2. Fallback to broad search if exact match fails (common due to Spotify title formatting)
+    const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(trackName + " " + artistName)}`;
+    res = await ctx.net.fetch(searchUrl, { method: "GET" });
+    if (!res.json && res.text) {
+      try { res.json = JSON.parse(res.text); } catch (e) {}
+    }
+    
+    if (res.ok && res.json && res.json.length > 0) {
+      // Prefer a result with synced lyrics, otherwise just take the first one
+      const best = res.json.find(t => t.syncedLyrics) || res.json[0];
+      return best;
     }
   } catch (e) {
     ctx.log?.warn?.("LRCLIB error", e?.message);
