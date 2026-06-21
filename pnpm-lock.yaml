@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@open-pets/client':
+        specifier: ^2.1.1
+        version: 2.1.1
+
+packages:
+
+  '@open-pets/client@2.1.1':
+    resolution: {integrity: sha512-vRDoVMarl5Ben9FO2i/X/sTQQLgydiW8UrNYr6obtsw333YkQTT0VZNkwXkCc38a8s+lPMlOEjDFmr9q3ibAfw==}
+
+snapshots:
+
+  '@open-pets/client@2.1.1': {}

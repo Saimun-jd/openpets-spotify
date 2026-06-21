@@ -1,31 +1,39 @@
 {
-  "manifestVersion": 2,
+  "manifestVersion": 3,
   "id": "openpets.spotify-buddy",
   "name": "Spotify Buddy",
   "description": "Your pet reacts to Spotify, syncs lyrics in real time, and controls playback.",
   "version": "1.8.0",
   "runtime": "javascript",
   "icon": "sparkles",
-  "sdkVersion": "1.0.0",
+  "sdkVersion": "3.0.0",
   "entry": "index.js",
   "permissions": [
     "network",
+    "network:write",
     "schedule",
     "storage",
     "pet:speak",
     "pet:reaction",
     "commands",
-    "status"
+    "status",
+    "auth",
+    "secrets",
+    "ui:toast"
   ],
   "network": {
-    "hosts": ["spotify-bridge.onrender.com"]
+    "hosts": [
+      "api.spotify.com",
+      "accounts.spotify.com",
+      "lrclib.net"
+    ]
   },
   "configSchema": {
-    "bridgeUrl": {
+    "spotifyClientId": {
       "type": "text",
-      "label": "Spotify Bridge URL (HTTPS)",
-      "default": "https://spotify-bridge.onrender.com",
-      "description": "Your Render.com deployment URL"
+      "label": "Spotify Client ID",
+      "default": "",
+      "description": "Your Spotify App Client ID"
     },
     "pollIntervalSeconds": {
       "type": "number",

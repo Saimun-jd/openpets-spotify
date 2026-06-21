@@ -64,3 +64,6 @@ debug-*.md
 .cache/
 .npm/
 .yarn/
+
+openpets_repo/
+node_modules/

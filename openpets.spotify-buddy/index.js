@@ -1,8 +1,4 @@
 // Spotify Buddy — OpenPets Plugin (manifestVersion 2, sdkVersion 1.0.0)
-//
-// IMPORTANT: The OpenPets plugin sandbox only supports ctx.http.fetch with
-// method: "GET". There is no POST capability. All playback control endpoints
-// on your bridge (/pause, /play, /next, /previous) must accept GET requests.
 
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 const MIN_POLL_INTERVAL_SECONDS = 2;
@@ -110,56 +106,154 @@ function seekDriftDetected(nowProgressMs) {
   return Math.abs(expectedProgress - nowProgressMs) > SEEK_DRIFT_THRESHOLD_MS;
 }
 
-// ─── Bridge fetch ─────────────────────────────────────────────────────────────
-//
-// ctx.http.fetch is the ONLY network method available to plugins.
-// It is GET-only and HTTPS-only by SDK design — there is no POST support.
-//
-// This single helper is used for both read endpoints (/now-playing, /lyrics)
-// AND control endpoints (/pause, /play, /next, /previous).
-//
-// !! Your bridge server MUST accept GET requests on all control endpoints. !!
-//
-// Example Express routes to add on your bridge:
-//   app.get('/pause',    (req, res) => { spotifyApi.pause();   res.sendStatus(204); });
-//   app.get('/play',     (req, res) => { spotifyApi.play();    res.sendStatus(204); });
-//   app.get('/next',     (req, res) => { spotifyApi.next();    res.sendStatus(204); });
-//   app.get('/previous', (req, res) => { spotifyApi.previous(); res.sendStatus(204); });
+// ─── Native Auth & Fetch ──────────────────────────────────────────────────────
 
-async function bridgeFetch(ctx, bridgeUrl, path) {
+async function getSpotifyClientId(ctx) {
+  const config = await ctx.config.get();
+  return config.spotifyClientId || "ae6b04810e434d66a9a52145b53c5b7d"; // Using user's provided extended quota Client ID
+}
+
+async function loginSpotify(ctx) {
   try {
-    const base = String(bridgeUrl || "").replace(/\/+$/, "");
-    const url = `${base}${path}`;
-    ctx.log?.info?.("GET", { url });
-    const res = await ctx.http.fetch(url, {
-      method: "GET",
-      headers: {
-        "ngrok-skip-browser-warning": "true",
-        "user-agent": "OpenPets Spotify Buddy",
-      },
-      timeoutMs: 10000,
+    const clientId = await getSpotifyClientId(ctx);
+    // Using ctx.auth.oauth as per available methods
+    const tokens = await ctx.auth.oauth({
+      provider: "spotify",
+      clientId,
+      authUrl: "https://accounts.spotify.com/authorize",
+      authorizationUrl: "https://accounts.spotify.com/authorize",
+      tokenUrl: "https://accounts.spotify.com/api/token",
+      redirectUri: "http://127.0.0.1:48373/callback",
+      scopes: ["user-read-playback-state", "user-modify-playback-state", "user-read-currently-playing"],
+      usePkce: true
     });
-    ctx.log?.info?.("Response", { status: res.status, ok: res.ok });
-    return res;
+    
+    await ctx.secrets.set("spotify-access-token", tokens.accessToken);
+    await ctx.secrets.set("spotify-refresh-token", tokens.refreshToken);
+    await ctx.secrets.set("spotify-expires-at", String(Date.now() + (tokens.expiresIn || 3600) * 1000));
+    
+    await ctx.pet.speak("Successfully connected to Spotify!");
+    await ctx.pet.react("celebrating");
+    return true;
   } catch (e) {
-    ctx.log?.warn?.("Fetch error", { path, msg: e?.message || String(e) });
-    return null;
+    ctx.log?.error?.("Spotify login failed", e?.message);
+    const msg = String(e?.message || "Unknown error")
+      .replace(/Error invoking remote method '[^']+':\s*/, "")
+      .slice(0, 100);
+    await ctx.pet.speak("Spotify login failed: " + msg);
+    return false;
   }
 }
 
-// Convenience: fetch and parse JSON (used for /now-playing and /lyrics)
-async function bridgeGetJson(ctx, bridgeUrl, path) {
-  const res = await bridgeFetch(ctx, bridgeUrl, path);
-  if (!res || !res.ok) return null;
-  return res.json ?? null;
+async function refreshAccessToken(ctx) {
+  const refreshToken = await ctx.secrets.get("spotify-refresh-token");
+  const clientId = await getSpotifyClientId(ctx);
+  
+  if (!refreshToken) return null;
+  
+  try {
+    const res = await ctx.net.fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId
+      }).toString()
+    });
+    
+    if (res.ok && res.json) {
+      await ctx.secrets.set("spotify-access-token", res.json.access_token);
+      if (res.json.refresh_token) {
+        await ctx.secrets.set("spotify-refresh-token", res.json.refresh_token);
+      }
+      await ctx.secrets.set("spotify-expires-at", String(Date.now() + res.json.expires_in * 1000));
+      return res.json.access_token;
+    }
+  } catch (e) {
+    ctx.log?.warn?.("Token refresh failed", e?.message);
+  }
+  return null;
 }
 
-// Convenience: fire a control endpoint and return success bool
-// 204 No Content counts as success (standard Spotify control response)
-async function bridgeControl(ctx, bridgeUrl, path) {
-  const res = await bridgeFetch(ctx, bridgeUrl, path);
-  if (!res) return false;
-  return res.ok || res.status === 204;
+async function getValidToken(ctx) {
+  let token = await ctx.secrets.get("spotify-access-token");
+  let expiresAt = Number(await ctx.secrets.get("spotify-expires-at") || 0);
+  
+  if (!token || Date.now() > expiresAt - 60000) {
+    token = await refreshAccessToken(ctx);
+  }
+  return token;
+}
+
+async function spotifyFetch(ctx, path, method = "GET", body = null) {
+  const token = await getValidToken(ctx);
+  if (!token) {
+    throw new Error("NOT_AUTHENTICATED");
+  }
+  
+  const options = {
+    method,
+    headers: {
+      "Authorization": `Bearer ${token}`
+    }
+  };
+  
+  if (body) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  
+  const url = `https://api.spotify.com/v1${path}`;
+  let res = await ctx.net.fetch(url, options);
+  
+  if (res.status === 401) {
+    const newToken = await refreshAccessToken(ctx);
+    if (newToken) {
+      options.headers["Authorization"] = `Bearer ${newToken}`;
+      res = await ctx.net.fetch(url, options);
+    } else {
+      throw new Error("NOT_AUTHENTICATED");
+    }
+  }
+  
+  if (!res.json && res.text) {
+    try { res.json = JSON.parse(res.text); } catch (e) {}
+  }
+  
+  return res;
+}
+
+async function getLRCLIBLyrics(ctx, trackName, artistName, durationMs) {
+  try {
+    const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${Math.round(durationMs / 1000)}`;
+    const res = await ctx.net.fetch(url, { method: "GET" });
+    if (res.ok && res.json) {
+      return res.json;
+    }
+  } catch (e) {
+    ctx.log?.warn?.("LRCLIB error", e?.message);
+  }
+  return null;
+}
+
+function parseSyncedLyrics(syncedStr) {
+  if (!syncedStr) return [];
+  const lines = syncedStr.split('\n');
+  const lyrics = [];
+  const regex = /\[(\d{2}):(\d{2}\.\d{2,3})\](.*)/;
+  
+  for (const line of lines) {
+    const match = line.match(regex);
+    if (match) {
+      const minutes = parseInt(match[1], 10);
+      const seconds = parseFloat(match[2]);
+      const text = match[3].trim();
+      const timestamp = (minutes * 60 + seconds) * 1000;
+      lyrics.push({ timestamp, text });
+    }
+  }
+  return lyrics;
 }
 
 // ─── Plugin registration ──────────────────────────────────────────────────────
@@ -168,7 +262,11 @@ export function register(OpenPetsPlugin) {
   OpenPetsPlugin.register({
     async start(ctx) {
 
-      // ── Check Spotify Now ──────────────────────────────────────────────────
+      await ctx.commands.register(
+        { id: "spotify-login", title: "Login to Spotify", description: "Connect your Spotify account." },
+        async () => { await loginSpotify(ctx); }
+      );
+
       await ctx.commands.register(
         { id: "check-spotify-now", title: "Check Spotify Now", description: "Check what's playing on Spotify right now." },
         async () => {
@@ -177,37 +275,31 @@ export function register(OpenPetsPlugin) {
         }
       );
 
-      // ── What's Playing? ────────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-whats-playing", title: "What's Playing?", description: "Ask your pet what's currently playing." },
         async () => { await showWhatsPlaying(ctx); }
       );
 
-      // ── Pause / Play toggle ────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-pause-play", title: "Pause / Play", description: "Toggle Spotify playback." },
         async () => { await togglePausePlay(ctx); }
       );
 
-      // ── Next Track ────────────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-next-track", title: "Play Next Track", description: "Skip to the next track." },
-        async () => { await controlPlayback(ctx, "/next", "Playing next track!"); }
+        async () => { await controlPlayback(ctx, "/me/player/next", "POST", "Playing next track!"); }
       );
 
-      // ── Previous Track ────────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-previous-track", title: "Play Previous Track", description: "Go back to the previous track." },
-        async () => { await controlPlayback(ctx, "/previous", "Playing previous track!"); }
+        async () => { await controlPlayback(ctx, "/me/player/previous", "POST", "Playing previous track!"); }
       );
 
-      // ── Show Lyrics ───────────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-show-lyrics", title: "Show Lyrics", description: "Recite lyrics from the current song." },
         async () => { await showLyrics(ctx); }
       );
 
-      // ── Reset State ───────────────────────────────────────────────────────
       await ctx.commands.register(
         { id: "spotify-reset-state", title: "Reset Spotify State", description: "Clear saved Spotify state." },
         async () => { await resetSpotifyState(ctx); }
@@ -245,19 +337,30 @@ async function checkNow(ctx, manual) {
   }
   pollRunning = true;
   try {
-    const config = await ctx.config.get();
-    const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
+    let res;
+    try {
+      res = await spotifyFetch(ctx, "/me/player");
+    } catch (e) {
+      if (e.message === "NOT_AUTHENTICATED") {
+        await ctx.status.set({ text: "Spotify: needs login", tone: "warning" });
+        if (manual) await ctx.pet.speak("Please login to Spotify first.");
+        return;
+      }
+      throw e;
+    }
 
-    if (!nowPlaying) {
-      await ctx.status.set({ text: "Spotify: bridge unreachable", tone: "warning" });
-      if (manual) await ctx.pet.speak("Couldn't reach Spotify bridge.");
+    if (res && !res.ok && res.status !== 204) {
+      if (manual) {
+        await ctx.pet.speak(`Spotify API error: ${res.status} ${res.text?.slice(0, 50)}`);
+      }
       return;
     }
 
-    if (!nowPlaying.playing) {
+    if (!res || res.status === 204 || !res.json || !res.json.item) {
       const lastPlaying = await ctx.storage.get("spotify-lastPlaying");
       await cancelLyricSchedules(ctx);
       await ctx.status.set({ text: "Spotify: nothing playing", tone: "info" });
+      const config = await ctx.config.get();
       if (lastPlaying && config.reactWhenPaused) await ctx.pet.react("idle");
       await ctx.storage.set("spotify-lastPlaying", false);
       await ctx.storage.set("spotify-lastTrackId", EMPTY_TRACK_ID);
@@ -266,38 +369,70 @@ async function checkNow(ctx, manual) {
       return;
     }
 
+    const nowPlaying = {
+      playing: res.json.is_playing,
+      trackId: res.json.item.id,
+      title: res.json.item.name,
+      artist: res.json.item.artists.map(a => a.name).join(", "),
+      progressMs: res.json.progress_ms,
+      durationMs: res.json.item.duration_ms
+    };
+    
+    // Attempt to get audio features for mood if track changed
     const lastTrackId = String(await ctx.storage.get("spotify-lastTrackId") || EMPTY_TRACK_ID);
-    const currentTrackId = String(nowPlaying.trackId || EMPTY_TRACK_ID);
-    const trackChanged = lastTrackId !== currentTrackId;
-    const progressMs = nowPlaying.progressMs ?? 0;
+    const trackChanged = lastTrackId !== nowPlaying.trackId;
+    const config = await ctx.config.get();
+
+    if (trackChanged && config.reactToMood) {
+      try {
+        const featuresRes = await spotifyFetch(ctx, `/audio-features/${nowPlaying.trackId}`);
+        if (featuresRes.ok && featuresRes.json) {
+          nowPlaying.features = featuresRes.json;
+        }
+      } catch (e) {}
+    }
+
+    if (!nowPlaying.playing) {
+      const lastPlaying = await ctx.storage.get("spotify-lastPlaying");
+      await cancelLyricSchedules(ctx);
+      await ctx.status.set({ text: "Spotify: paused ⏸", tone: "info" });
+      if (lastPlaying && config.reactWhenPaused) await ctx.pet.react("idle");
+      await ctx.storage.set("spotify-lastPlaying", false);
+      return;
+    }
 
     if (trackChanged) {
       await cancelLyricSchedules(ctx);
 
       const announcement = format(
         config.announceTemplate || "Now playing: {title} by {artist}",
-        { title: nowPlaying.title, artist: nowPlaying.artist }
+        nowPlaying
       );
       if (config.announceTrackChanges) await ctx.pet.speak(announcement);
       await ctx.pet.react(config.reactToMood ? featuresToReaction(nowPlaying.features) : "celebrating");
 
-      await ctx.storage.set("spotify-lastTrackId", currentTrackId);
+      await ctx.storage.set("spotify-lastTrackId", nowPlaying.trackId);
       await ctx.storage.set("spotify-lastLyricIndex", -1);
 
-      const lyricsData = await bridgeGetJson(ctx, config.bridgeUrl, "/lyrics");
-      const syncedLyrics = lyricsData?.lyrics?.synced || null;
-      ctx.log?.info?.("Lyrics loaded", { count: syncedLyrics?.length ?? 0 });
+      const lrclibData = await getLRCLIBLyrics(ctx, nowPlaying.title, nowPlaying.artist, nowPlaying.durationMs);
+      const syncedLyrics = parseSyncedLyrics(lrclibData?.syncedLyrics);
+      ctx.log?.info?.("Lyrics loaded from LRCLIB", { count: syncedLyrics.length });
+      
+      // IPC messages have size limits. Only store the snippet we need for showLyrics.
+      const plainSnippet = lrclibData?.plainLyrics ? lrclibData.plainLyrics.slice(0, 500) : null;
+      
       await ctx.storage.set("spotify-lyrics", syncedLyrics);
+      await ctx.storage.set("spotify-lyrics-plain", plainSnippet);
 
-      if (syncedLyrics?.length) {
-        await scheduleLyrics(ctx, syncedLyrics, progressMs);
+      if (syncedLyrics.length) {
+        await scheduleLyrics(ctx, syncedLyrics, nowPlaying.progressMs);
       }
     } else {
-      if (nowPlaying.progressMs !== undefined && seekDriftDetected(progressMs)) {
+      if (nowPlaying.progressMs !== undefined && seekDriftDetected(nowPlaying.progressMs)) {
         const storedLyrics = await ctx.storage.get("spotify-lyrics");
         if (storedLyrics?.length) {
-          ctx.log?.info?.("Seek/drift detected — rescheduling lyrics", { progressMs });
-          await scheduleLyrics(ctx, storedLyrics, progressMs);
+          ctx.log?.info?.("Seek/drift detected — rescheduling lyrics", { progressMs: nowPlaying.progressMs });
+          await scheduleLyrics(ctx, storedLyrics, nowPlaying.progressMs);
         }
       }
     }
@@ -311,7 +446,7 @@ async function checkNow(ctx, manual) {
     if (manual && !trackChanged) {
       await ctx.pet.speak(format(
         config.announceTemplate || "Now playing: {title} by {artist}",
-        { title: nowPlaying.title, artist: nowPlaying.artist }
+        nowPlaying
       ));
     }
   } finally {
@@ -323,63 +458,101 @@ async function checkNow(ctx, manual) {
 
 async function showWhatsPlaying(ctx) {
   const config = await ctx.config.get();
-  const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
-  if (!nowPlaying?.playing) {
-    await ctx.pet.speak("Nothing is playing right now.");
-    return;
+  try {
+    const res = await spotifyFetch(ctx, "/me/player");
+    if (!res) {
+      await ctx.pet.speak("Network error: Spotify didn't respond.");
+      return;
+    }
+    if (res.status === 204) {
+      await ctx.pet.speak("Spotify is open, but no active device or playback session was found.");
+      return;
+    }
+    if (!res.ok) {
+      await ctx.pet.speak(`Spotify API error: ${res.status} ${res.text?.slice(0, 50)}`);
+      return;
+    }
+    if (!res.json || !res.json.is_playing) {
+      await ctx.pet.speak("Nothing is playing right now.");
+      return;
+    }
+    const title = res.json.item.name;
+    const artist = res.json.item.artists.map(a => a.name).join(", ");
+    await ctx.pet.speak(format(
+      config.announceTemplate || "Now playing: {title} by {artist}",
+      { title, artist }
+    ));
+  } catch (e) {
+    ctx.log?.error?.("showWhatsPlaying error:", e);
+    await ctx.ui.toast({
+      text: e.message === "NOT_AUTHENTICATED" ? "Please login to Spotify first." : "Couldn't fetch current track.",
+      tone: "error"
+    });
   }
-  await ctx.pet.speak(format(
-    config.announceTemplate || "Now playing: {title} by {artist}",
-    { title: nowPlaying.title, artist: nowPlaying.artist }
-  ));
 }
 
 async function togglePausePlay(ctx) {
-  const config = await ctx.config.get();
-  const nowPlaying = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
-
-  if (!nowPlaying) {
-    await ctx.pet.speak("Can't reach Spotify bridge.");
-    return;
-  }
-
-  if (nowPlaying.playing) {
-    await cancelLyricSchedules(ctx);
-    const ok = await bridgeControl(ctx, config.bridgeUrl, "/pause");
-    if (ok) {
-      await ctx.pet.speak("Paused.");
-      await ctx.pet.react("idle");
-      await ctx.status.set({ text: "Spotify: paused ⏸", tone: "info" });
-    } else {
-      await ctx.pet.speak("Couldn't pause Spotify.");
+  try {
+    const res = await spotifyFetch(ctx, "/me/player");
+    if (!res || !res.ok) {
+      await ctx.pet.speak("Spotify API error checking playback state.");
+      return;
     }
-  } else {
-    const ok = await bridgeControl(ctx, config.bridgeUrl, "/play");
-    if (ok) {
-      await ctx.pet.speak("Resuming playback!");
-      await ctx.pet.react("celebrating");
-      await ctx.status.set({ text: "Spotify: resuming…", tone: "success" });
-      await ctx.schedule.once("spotify-resume-check", 1200, async () => {
-        await checkNow(ctx, false);
-      });
-    } else {
-      await ctx.pet.speak("Couldn't resume Spotify.");
+    if (res.status === 204 || !res.json) {
+      await ctx.pet.speak("No active playback session found to toggle.");
+      return;
     }
+    
+    if (res.json.is_playing) {
+      await cancelLyricSchedules(ctx);
+      const actionRes = await spotifyFetch(ctx, "/me/player/pause", "PUT");
+      if (actionRes.ok || actionRes.status === 204) {
+        await ctx.ui.toast({ text: "Spotify Paused", tone: "info" });
+        await ctx.pet.react("idle");
+        await ctx.status.set({ text: "Spotify: paused ⏸", tone: "info" });
+      } else {
+        await ctx.ui.toast({ text: "Couldn't pause Spotify.", tone: "error" });
+      }
+    } else {
+      const actionRes = await spotifyFetch(ctx, "/me/player/play", "PUT");
+      if (actionRes.ok || actionRes.status === 204) {
+        await ctx.ui.toast({ text: "Resuming playback!", tone: "success" });
+        await ctx.pet.react("celebrating");
+        await ctx.status.set({ text: "Spotify: resuming…", tone: "success" });
+        await ctx.schedule.once("spotify-resume-check", 1200, async () => {
+          await checkNow(ctx, false);
+        });
+      } else {
+        await ctx.ui.toast({ text: "Couldn't resume Spotify.", tone: "error" });
+      }
+    }
+  } catch (e) {
+    ctx.log?.error?.("togglePausePlay error:", e);
+    await ctx.ui.toast({
+      text: e.message === "NOT_AUTHENTICATED" ? "Please login to Spotify first." : "Failed to toggle playback.",
+      tone: "error"
+    });
   }
 }
 
-async function controlPlayback(ctx, path, message) {
-  const config = await ctx.config.get();
-  await cancelLyricSchedules(ctx);
-  const ok = await bridgeControl(ctx, config.bridgeUrl, path);
-  if (ok) {
-    await ctx.pet.speak(message);
-    await ctx.schedule.once("spotify-skip-check", 800, async () => {
-      await checkNow(ctx, false);
+async function controlPlayback(ctx, path, method, message) {
+  try {
+    await cancelLyricSchedules(ctx);
+    const res = await spotifyFetch(ctx, path, method);
+    if (res.ok || res.status === 204) {
+      await ctx.ui.toast({ text: message, tone: "info" });
+      await ctx.schedule.once("spotify-skip-check", 800, async () => {
+        await checkNow(ctx, false);
+      });
+    } else {
+      await ctx.ui.toast({ text: "Playback control failed.", tone: "error" });
+    }
+  } catch (e) {
+    ctx.log?.error?.("controlPlayback error:", e);
+    await ctx.ui.toast({
+      text: e.message === "NOT_AUTHENTICATED" ? "Please login to Spotify first." : "Control failed.",
+      tone: "error"
     });
-  } else {
-    await ctx.pet.speak("Playback control failed. Check your bridge.");
-    ctx.log?.warn?.("bridgeControl failed", { path });
   }
 }
 
@@ -388,6 +561,7 @@ async function resetSpotifyState(ctx) {
   await ctx.storage.delete("spotify-lastTrackId");
   await ctx.storage.delete("spotify-lastPlaying");
   await ctx.storage.delete("spotify-lyrics");
+  await ctx.storage.delete("spotify-lyrics-plain");
   await ctx.storage.delete("spotify-lastLyricIndex");
   await ctx.status.set({ text: "Spotify: state cleared", tone: "info" });
   await ctx.pet.speak("Spotify state has been reset.");
@@ -396,36 +570,32 @@ async function resetSpotifyState(ctx) {
 
 async function showLyrics(ctx) {
   try {
-    const config = await ctx.config.get();
-    const testData = await bridgeGetJson(ctx, config.bridgeUrl, "/now-playing");
-    if (!testData) {
-      await ctx.pet.speak("Can't reach Spotify bridge.");
+    const res = await spotifyFetch(ctx, "/me/player");
+    if (!res || !res.ok) {
+      await ctx.pet.speak("Spotify API error checking playback state.");
       return;
     }
-
-    const data = await bridgeGetJson(ctx, config.bridgeUrl, "/lyrics");
-    if (!data) {
-      await ctx.pet.speak("Lyrics endpoint not responding.");
+    if (res.status === 204 || !res.json || !res.json.item) {
+      await ctx.pet.speak("No active playback session found to get lyrics for.");
       return;
     }
+    
+    const plainLyrics = await ctx.storage.get("spotify-lyrics-plain");
+    const syncedLyrics = await ctx.storage.get("spotify-lyrics");
 
-    if (!data.lyrics?.plain && (!data.lyrics?.synced || data.lyrics.synced.length === 0)) {
+    if (!plainLyrics && (!syncedLyrics || syncedLyrics.length === 0)) {
       await ctx.pet.speak("No lyrics available for this song.");
       return;
     }
 
     let rawLyrics;
-    if (data.lyrics.plain) {
-      rawLyrics = data.lyrics.plain;
-    } else if (data.lyrics.synced?.length) {
-      rawLyrics = data.lyrics.synced.map(l => l.text).join(" ");
+    if (plainLyrics) {
+      rawLyrics = plainLyrics;
     } else {
-      await ctx.pet.speak("No lyrics text found.");
-      return;
+      rawLyrics = syncedLyrics.map(l => l.text).join(" ");
     }
 
     const cleaned = rawLyrics
-      .replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "")
       .replace(/\r?\n/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -435,13 +605,19 @@ async function showLyrics(ctx) {
       return;
     }
 
-    const snippet = cleaned.length > 137 ? cleaned.slice(0, 137).trim() + "..." : cleaned;
+    const snippet = cleaned.length > 250 ? cleaned.slice(0, 250).trim() + "..." : cleaned;
     const final = snippet.replace(/[`'"<>]/g, "").trim();
-    await ctx.pet.speak(final || "Lyrics couldn't be displayed.");
+    
+    await ctx.ui.bubble({
+      text: final || "Lyrics couldn't be displayed.",
+      durationMs: 12000,
+      icon: "sparkles",
+      tone: "success"
+    });
     
   } catch (error) {
     ctx.log?.error?.("showLyrics error:", error);
-    await ctx.pet.speak("Error getting lyrics: " + (error?.message || "unknown"));
+    await ctx.ui.toast({ text: "Error getting lyrics", tone: "error" });
   }
 }
 

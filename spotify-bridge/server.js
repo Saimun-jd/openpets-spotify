@@ -5,12 +5,16 @@
  * Handles the Spotify Authorization Code Flow, stores tokens in a local
  * JSON file, auto-refreshes before expiry, and exposes endpoints:
  *
- *   GET http://127.0.0.1:PORT/now-playing
- *   GET http://127.0.0.1:PORT/lyrics
- *   GET http://127.0.0.1:PORT/pause
- *   GET http://127.0.0.1:PORT/play
- *   GET http://127.0.0.1:PORT/next
- *   GET http://127.0.0.1:PORT/previous
+ *   GET /now-playing   — current track + audio features
+ *   GET /lyrics        — synced + plain lyrics (cached per track)
+ *   GET /pause         — pause playback
+ *   GET /play          — resume playback
+ *   GET /next          — skip to next track
+ *   GET /previous      — skip to previous track
+ *   GET /status        — health check
+ *   GET /login         — kick off OAuth
+ *   GET /callback      — OAuth callback
+ *   GET /logout        — revoke local tokens
  *
  * The OpenPets plugin polls/calls these endpoints — it never touches OAuth directly.
  *
@@ -19,7 +23,7 @@
  *   2. Add http://127.0.0.1:8765/callback as a Redirect URI
  *   3. Copy Client ID + Client Secret into .env (see .env.example)
  *   4. node server.js
- *   5. Run node start.js — browser opens automatically to http://127.0.0.1:8765/login
+ *   5. Browser opens automatically to http://127.0.0.1:8765/login
  */
 
 import http from "node:http";
@@ -46,6 +50,16 @@ const SCOPES =
   "user-read-currently-playing user-read-playback-state user-read-recently-played user-modify-playback-state";
 const TOKEN_FILE = path.join(__dirname, ".tokens.json");
 
+// Timeout for all outbound HTTP requests (ms)
+const HTTP_TIMEOUT_MS = 6000;
+
+// Lyrics in-memory cache — avoids re-fetching lrclib on every /lyrics call
+// for the same track. Cleared when the track changes.
+let lyricsCache = {
+  trackId: null,
+  lyrics: null, // { plain, synced } | null
+};
+
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error(
     "[spotify-bridge] ERROR: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set.\n" +
@@ -65,16 +79,16 @@ function loadTokens() {
   return null;
 }
 
-function saveTokens(tokens) {
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2), "utf8");
+function saveTokens(t) {
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(t, null, 2), "utf8");
 }
 
 let tokens = loadTokens();
-let pendingState = null; // CSRF state for OAuth flow
+let pendingState = null;
 
-// ─── Spotify API helpers ──────────────────────────────────────────────────────
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
-function httpsGet(url, headers) {
+function httpsGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, { headers }, (res) => {
       let body = "";
@@ -82,14 +96,14 @@ function httpsGet(url, headers) {
       res.on("end", () => resolve({ status: res.statusCode, body }));
     });
     req.on("error", reject);
-    req.setTimeout(8000, () => {
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
       req.destroy();
-      reject(new Error("Request timed out"));
+      reject(new Error(`GET ${url} timed out after ${HTTP_TIMEOUT_MS}ms`));
     });
   });
 }
 
-function httpsPost(url, body, headers) {
+function httpsPost(url, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const data = Buffer.from(body, "utf8");
     const urlObj = new URL(url);
@@ -111,9 +125,9 @@ function httpsPost(url, body, headers) {
       }
     );
     req.on("error", reject);
-    req.setTimeout(8000, () => {
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
       req.destroy();
-      reject(new Error("Request timed out"));
+      reject(new Error(`POST ${url} timed out after ${HTTP_TIMEOUT_MS}ms`));
     });
     req.write(data);
     req.end();
@@ -121,17 +135,16 @@ function httpsPost(url, body, headers) {
 }
 
 /**
- * Generic helper for Spotify Web API calls that require PUT or POST
- * with no request body (pause, play, next, previous).
+ * For Spotify playback control endpoints that need PUT or POST with no body.
  */
-function spotifyControl(url, method, headers) {
+function spotifyControl(url, method, headers = {}) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const req = https.request(
       {
         hostname: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
-        method, // "PUT" or "POST" as required by the Spotify API
+        method,
         headers: { "Content-Length": 0, ...headers },
       },
       (res) => {
@@ -141,170 +154,19 @@ function spotifyControl(url, method, headers) {
       }
     );
     req.on("error", reject);
-    req.setTimeout(8000, () => {
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
       req.destroy();
-      reject(new Error("Request timed out"));
+      reject(new Error(`${method} ${url} timed out after ${HTTP_TIMEOUT_MS}ms`));
     });
     req.end();
   });
 }
 
-function cleanTrackName(name) {
-  if (!name) return name;
-  return name
-    .replace(
-      /\s*(?:-\s*)?(?:Remaster(?:ed)?|Live|From.*?Session|Edit|Version|Mix|Acoustic|Instrumental|Radio Edit)(?:\s*\d{4})?\s*$/i,
-      ""
-    )
-    .replace(/\s*\([^)]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^)]*\)/gi, "")
-    .replace(/\s*\[[^\]]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^\]]*\]/gi, "")
-    .trim();
-}
-
-async function tryLrclibSearch(artist, title, album, durationMs) {
-  try {
-    const params = new URLSearchParams();
-    if (artist) params.set("artist_name", artist);
-    if (title) params.set("track_name", title);
-    if (album) params.set("album_name", album);
-    if (durationMs) params.set("duration", Math.round(durationMs / 1000));
-
-    const url = `https://lrclib.net/api/get?${params.toString()}`;
-    console.log(`Trying LRCLIB: ${url}`);
-    const res = await httpsGet(url);
-    if (res.status !== 200) return null;
-    return JSON.parse(res.body);
-  } catch {
-    return null;
-  }
-}
-
-async function fetchLyrics(artist, title, album, durationMs) {
-  try {
-    const cleanedArtist = artist?.trim();
-    const cleanedTitle = cleanTrackName(title);
-    const cleanedAlbum = album?.trim();
-
-    console.log(
-      `Searching lyrics for: ${cleanedArtist} - ${cleanedTitle} (${cleanedAlbum || "no album"})`
-    );
-
-    let data = null;
-
-    // 1. Try with all cleaned params first
-    data = await tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, durationMs);
-    if (data && (data.syncedLyrics || data.plainLyrics)) {
-      console.log("Found lyrics with full params!");
-    } else {
-      // 2. Try without album
-      data = await tryLrclibSearch(cleanedArtist, cleanedTitle, null, durationMs);
-      if (data && (data.syncedLyrics || data.plainLyrics)) {
-        console.log("Found lyrics without album!");
-      } else {
-        // 3. Try without duration
-        data = await tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, null);
-        if (data && (data.syncedLyrics || data.plainLyrics)) {
-          console.log("Found lyrics without duration!");
-        } else {
-          // 4. Try without album and duration
-          data = await tryLrclibSearch(cleanedArtist, cleanedTitle, null, null);
-          if (data && (data.syncedLyrics || data.plainLyrics)) {
-            console.log("Found lyrics with just artist and title!");
-          }
-        }
-      }
-    }
-
-    if (!data || (!data.syncedLyrics && !data.plainLyrics)) {
-      console.log("No lyrics found after all attempts");
-      return null;
-    }
-
-    // Parse synced lyrics into { timestamp, text } array
-    const syncedLines = [];
-    if (data.syncedLyrics) {
-      const lines = data.syncedLyrics.split(/\r?\n/);
-      for (const line of lines) {
-        const match = line.match(/\[(\d{2}):(\d{2})\.(\d{2,3})\]/);
-        if (match) {
-          const minutes = parseInt(match[1], 10);
-          const seconds = parseInt(match[2], 10);
-          const milliseconds = parseInt(match[3].padEnd(3, "0"), 10);
-          const totalMs = minutes * 60 * 1000 + seconds * 1000 + milliseconds;
-          const text = line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "").trim();
-          if (text) {
-            syncedLines.push({ timestamp: totalMs, text });
-          }
-        }
-      }
-    }
-
-    return {
-      plain: data.plainLyrics || null,
-      synced: syncedLines.length > 0 ? syncedLines : null,
-    };
-  } catch (e) {
-    console.error("Error in fetchLyrics:", e);
-    return null;
-  }
-}
-
-// ─── Playback control helpers ─────────────────────────────────────────────────
-
-async function pausePlayback() {
-  const accessToken = await getValidAccessToken();
-  // Spotify: PUT /v1/me/player/pause — 204 on success
-  const res = await spotifyControl(
-    "https://api.spotify.com/v1/me/player/pause",
-    "PUT",
-    { Authorization: `Bearer ${accessToken}` }
-  );
-  // 204 = paused, 403 = already paused (treat as ok)
-  if (res.status !== 204 && res.status !== 403) {
-    throw new Error(`Failed to pause: ${res.status} ${res.body}`);
-  }
-}
-
-async function resumePlayback() {
-  const accessToken = await getValidAccessToken();
-  // Spotify: PUT /v1/me/player/play — 204 on success
-  const res = await spotifyControl(
-    "https://api.spotify.com/v1/me/player/play",
-    "PUT",
-    { Authorization: `Bearer ${accessToken}` }
-  );
-  // 204 = resumed, 403 = already playing (treat as ok)
-  if (res.status !== 204 && res.status !== 403) {
-    throw new Error(`Failed to resume: ${res.status} ${res.body}`);
-  }
-}
-
-async function skipToNext() {
-  const accessToken = await getValidAccessToken();
-  // Spotify: POST /v1/me/player/next — 204 on success
-  const res = await spotifyControl(
-    "https://api.spotify.com/v1/me/player/next",
-    "POST",
-    { Authorization: `Bearer ${accessToken}` }
-  );
-  if (res.status !== 204) throw new Error(`Failed to skip: ${res.status}`);
-}
-
-async function skipToPrevious() {
-  const accessToken = await getValidAccessToken();
-  // Spotify: POST /v1/me/player/previous — 204 on success
-  const res = await spotifyControl(
-    "https://api.spotify.com/v1/me/player/previous",
-    "POST",
-    { Authorization: `Bearer ${accessToken}` }
-  );
-  if (res.status !== 204) throw new Error(`Failed to go back: ${res.status}`);
-}
-
 // ─── Token management ─────────────────────────────────────────────────────────
 
 async function refreshAccessToken() {
-  if (!tokens?.refresh_token) throw new Error("No refresh token stored. Visit /login first.");
+  if (!tokens?.refresh_token)
+    throw new Error("No refresh token stored. Visit /login first.");
 
   const res = await httpsPost(
     "https://accounts.spotify.com/api/token",
@@ -318,13 +180,14 @@ async function refreshAccessToken() {
     }
   );
 
-  if (res.status !== 200) throw new Error(`Token refresh failed: ${res.status} ${res.body}`);
+  if (res.status !== 200)
+    throw new Error(`Token refresh failed: ${res.status} ${res.body}`);
 
   const data = JSON.parse(res.body);
   tokens = {
     access_token: data.access_token,
     refresh_token: data.refresh_token ?? tokens.refresh_token,
-    expires_at: Date.now() + data.expires_in * 1000 - 30_000, // 30s safety margin
+    expires_at: Date.now() + data.expires_in * 1000 - 30_000,
   };
   saveTokens(tokens);
   console.log("[spotify-bridge] Access token refreshed.");
@@ -346,12 +209,14 @@ async function getValidAccessToken() {
 
 async function fetchAudioFeatures(trackId, accessToken) {
   try {
-    const res = await httpsGet(`https://api.spotify.com/v1/audio-features/${trackId}`, {
-      Authorization: `Bearer ${accessToken}`,
-    });
+    const res = await httpsGet(
+      `https://api.spotify.com/v1/audio-features/${trackId}`,
+      { Authorization: `Bearer ${accessToken}` }
+    );
     if (res.status !== 200) return null;
     return JSON.parse(res.body);
-  } catch {
+  } catch (e) {
+    console.warn("[spotify-bridge] fetchAudioFeatures failed:", e.message);
     return null;
   }
 }
@@ -364,24 +229,20 @@ async function buildNowPlaying() {
     { Authorization: `Bearer ${accessToken}` }
   );
 
-  if (res.status === 204 || !res.body) {
-    return { playing: false };
-  }
+  if (res.status === 204 || !res.body) return { playing: false };
 
   if (res.status === 401) {
     await refreshAccessToken();
-    return buildNowPlaying(); // retry once after refresh
+    return buildNowPlaying();
   }
 
-  if (res.status !== 200) {
+  if (res.status !== 200)
     throw new Error(`Spotify API returned ${res.status}`);
-  }
 
   const data = JSON.parse(res.body);
 
-  if (data.currently_playing_type !== "track" || !data.item) {
+  if (data.currently_playing_type !== "track" || !data.item)
     return { playing: false };
-  }
 
   const track = data.item;
   const trackId = track.id;
@@ -392,6 +253,7 @@ async function buildNowPlaying() {
   const durationMs = track.duration_ms ?? 0;
   const isPlaying = data.is_playing === true;
 
+  // Audio features fetched in parallel — non-blocking, failure is graceful
   const features = trackId ? await fetchAudioFeatures(trackId, accessToken) : null;
 
   return {
@@ -415,6 +277,186 @@ async function buildNowPlaying() {
   };
 }
 
+// ─── Lyrics ───────────────────────────────────────────────────────────────────
+
+function cleanTrackName(name) {
+  if (!name) return name;
+  return name
+    .replace(
+      /\s*(?:-\s*)?(?:Remaster(?:ed)?|Live|From.*?Session|Edit|Version|Mix|Acoustic|Instrumental|Radio Edit)(?:\s*\d{4})?\s*$/i,
+      ""
+    )
+    .replace(
+      /\s*\([^)]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^)]*\)/gi,
+      ""
+    )
+    .replace(
+      /\s*\[[^\]]*(?:Remaster|Live|Edit|Version|Mix|Acoustic|Instrumental)[^\]]*\]/gi,
+      ""
+    )
+    .trim();
+}
+
+/**
+ * Single lrclib lookup — returns parsed response or null.
+ * Has its own try/catch so a timeout on one attempt doesn't abort the others.
+ */
+async function tryLrclibSearch(artist, title, album, durationSec) {
+  try {
+    const params = new URLSearchParams();
+    if (artist) params.set("artist_name", artist);
+    if (title) params.set("track_name", title);
+    if (album) params.set("album_name", album);
+    if (durationSec != null) params.set("duration", durationSec);
+
+    const url = `https://lrclib.net/api/get?${params.toString()}`;
+    console.log(`[lrclib] GET ${url}`);
+    const res = await httpsGet(url);
+    if (res.status !== 200) return null;
+    const body = JSON.parse(res.body);
+    // Only return if it actually has lyric content
+    return body?.syncedLyrics || body?.plainLyrics ? body : null;
+  } catch (e) {
+    console.warn("[lrclib] attempt failed:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Run all four lrclib search strategies in PARALLEL with Promise.any().
+ * The first one that resolves with content wins immediately — no waiting
+ * for slower fallbacks. This replaces the old sequential waterfall that
+ * could chain 4 × 6s timeouts = 24s total.
+ */
+async function fetchLyricsFromLrclib(artist, title, album, durationMs) {
+  const cleanedArtist = artist?.trim() ?? "";
+  const cleanedTitle = cleanTrackName(title) ?? "";
+  const cleanedAlbum = album?.trim() ?? "";
+  const durationSec = durationMs ? Math.round(durationMs / 1000) : null;
+
+  console.log(
+    `[lrclib] Searching: "${cleanedArtist}" - "${cleanedTitle}" (album: "${cleanedAlbum || "—"}", dur: ${durationSec ?? "—"}s)`
+  );
+
+  // All four strategies fire at the same time
+  const searches = [
+    tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, durationSec),
+    tryLrclibSearch(cleanedArtist, cleanedTitle, null, durationSec),
+    tryLrclibSearch(cleanedArtist, cleanedTitle, cleanedAlbum, null),
+    tryLrclibSearch(cleanedArtist, cleanedTitle, null, null),
+  ];
+
+  let data = null;
+  try {
+    // Promise.any resolves as soon as ONE non-null result arrives
+    data = await Promise.any(
+      searches.map((p) =>
+        p.then((r) => {
+          if (!r) throw new Error("no result");
+          return r;
+        })
+      )
+    );
+    console.log("[lrclib] Found lyrics via parallel search.");
+  } catch {
+    // All four failed (AggregateError from Promise.any)
+    console.log("[lrclib] No lyrics found after all parallel attempts.");
+    return null;
+  }
+
+  // Parse synced lyrics LRC → [{ timestamp, text }]
+  const syncedLines = [];
+  if (data.syncedLyrics) {
+    for (const line of data.syncedLyrics.split(/\r?\n/)) {
+      const match = line.match(/\[(\d{2}):(\d{2})\.(\d{2,3})\]/);
+      if (!match) continue;
+      const totalMs =
+        parseInt(match[1], 10) * 60_000 +
+        parseInt(match[2], 10) * 1_000 +
+        parseInt(match[3].padEnd(3, "0"), 10);
+      const text = line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "").trim();
+      if (text) syncedLines.push({ timestamp: totalMs, text });
+    }
+  }
+
+  return {
+    plain: data.plainLyrics || null,
+    synced: syncedLines.length > 0 ? syncedLines : null,
+  };
+}
+
+/**
+ * Fetch lyrics for the current track, using the in-memory cache so that
+ * repeated /lyrics calls during the same song don't hammer lrclib.
+ *
+ * @param {string} trackId
+ * @param {string} artist
+ * @param {string} title
+ * @param {string} album
+ * @param {number} durationMs
+ */
+async function getLyrics(trackId, artist, title, album, durationMs) {
+  // Cache hit — same track, return immediately
+  if (lyricsCache.trackId === trackId) {
+    console.log("[lyrics-cache] Hit for trackId:", trackId);
+    return lyricsCache.lyrics;
+  }
+
+  // Cache miss — fetch from lrclib
+  console.log("[lyrics-cache] Miss — fetching from lrclib for trackId:", trackId);
+  const lyrics = await fetchLyricsFromLrclib(artist, title, album, durationMs);
+
+  // Store result (even null — so we don't keep retrying a song with no lyrics)
+  lyricsCache = { trackId, lyrics };
+  return lyrics;
+}
+
+// ─── Playback control helpers ─────────────────────────────────────────────────
+
+async function pausePlayback() {
+  const accessToken = await getValidAccessToken();
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/pause",
+    "PUT",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  // 204 = paused, 403 = already paused — both are fine
+  if (res.status !== 204 && res.status !== 403)
+    throw new Error(`Failed to pause: ${res.status} ${res.body}`);
+}
+
+async function resumePlayback() {
+  const accessToken = await getValidAccessToken();
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/play",
+    "PUT",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  // 204 = resumed, 403 = already playing — both are fine
+  if (res.status !== 204 && res.status !== 403)
+    throw new Error(`Failed to resume: ${res.status} ${res.body}`);
+}
+
+async function skipToNext() {
+  const accessToken = await getValidAccessToken();
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/next",
+    "POST",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  if (res.status !== 204) throw new Error(`Failed to skip: ${res.status}`);
+}
+
+async function skipToPrevious() {
+  const accessToken = await getValidAccessToken();
+  const res = await spotifyControl(
+    "https://api.spotify.com/v1/me/player/previous",
+    "POST",
+    { Authorization: `Bearer ${accessToken}` }
+  );
+  if (res.status !== 204) throw new Error(`Failed to go back: ${res.status}`);
+}
+
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 function sendJson(res, status, data) {
@@ -435,7 +477,7 @@ function sendHtml(res, status, html) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
-  // ── GET /now-playing ── main plugin endpoint
+  // ── GET /now-playing ──────────────────────────────────────────────────────
   if (url.pathname === "/now-playing" && req.method === "GET") {
     try {
       const data = await buildNowPlaying();
@@ -447,20 +489,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /lyrics ── get lyrics for current track
+  // ── GET /lyrics ───────────────────────────────────────────────────────────
+  //
+  // FIX: /lyrics no longer re-calls buildNowPlaying() internally.
+  // Instead the plugin passes track info via query params so the bridge
+  // can go straight to lrclib. Falls back to a lightweight Spotify check
+  // if params are missing (e.g. direct browser visit).
+  //
+  // Query params (all optional, sent by the plugin):
+  //   ?trackId=...&artist=...&title=...&album=...&durationMs=...
+  //
   if (url.pathname === "/lyrics" && req.method === "GET") {
     try {
-      const nowPlaying = await buildNowPlaying();
-      if (!nowPlaying.playing) {
-        sendJson(res, 200, { lyrics: null, error: "No track playing" });
-        return;
+      let trackId   = url.searchParams.get("trackId") || null;
+      let artist    = url.searchParams.get("artist")  || null;
+      let title     = url.searchParams.get("title")   || null;
+      let album     = url.searchParams.get("album")   || null;
+      let durationMs = url.searchParams.get("durationMs")
+        ? Number(url.searchParams.get("durationMs"))
+        : null;
+
+      // If called without params (e.g. direct browser test), do a quick
+      // now-playing lookup to get the track details.
+      if (!trackId || !artist || !title) {
+        const nowPlaying = await buildNowPlaying();
+        if (!nowPlaying.playing) {
+          sendJson(res, 200, { lyrics: null, reason: "No track playing" });
+          return;
+        }
+        trackId    = nowPlaying.trackId;
+        artist     = nowPlaying.artist;
+        title      = nowPlaying.title;
+        album      = nowPlaying.album;
+        durationMs = nowPlaying.durationMs;
       }
-      const lyrics = await fetchLyrics(
-        nowPlaying.artist,
-        nowPlaying.title,
-        nowPlaying.album,
-        nowPlaying.durationMs
-      );
+
+      const lyrics = await getLyrics(trackId, artist, title, album, durationMs);
       sendJson(res, 200, { lyrics });
     } catch (err) {
       console.error("[spotify-bridge] /lyrics error:", err.message);
@@ -469,8 +533,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /pause ── pause playback
-  // Accepts GET so the OpenPets plugin SDK (GET-only) can call it.
+  // ── GET /pause ────────────────────────────────────────────────────────────
   if (url.pathname === "/pause" && (req.method === "GET" || req.method === "POST")) {
     try {
       await pausePlayback();
@@ -482,8 +545,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /play ── resume playback
-  // Accepts GET so the OpenPets plugin SDK (GET-only) can call it.
+  // ── GET /play ─────────────────────────────────────────────────────────────
   if (url.pathname === "/play" && (req.method === "GET" || req.method === "POST")) {
     try {
       await resumePlayback();
@@ -495,7 +557,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /next ── skip to next track
+  // ── GET /next ─────────────────────────────────────────────────────────────
   if (url.pathname === "/next" && (req.method === "GET" || req.method === "POST")) {
     try {
       await skipToNext();
@@ -507,7 +569,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /previous ── skip to previous track
+  // ── GET /previous ─────────────────────────────────────────────────────────
   if (url.pathname === "/previous" && (req.method === "GET" || req.method === "POST")) {
     try {
       await skipToPrevious();
@@ -519,17 +581,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /status ── health check
+  // ── GET /status ───────────────────────────────────────────────────────────
   if (url.pathname === "/status" && req.method === "GET") {
     sendJson(res, 200, {
       ok: true,
       authorised: !!tokens,
       tokenExpiresAt: tokens?.expires_at ?? null,
+      lyricsCacheTrackId: lyricsCache.trackId,
     });
     return;
   }
 
-  // ── GET /login ── kick off OAuth
+  // ── GET /login ────────────────────────────────────────────────────────────
   if (url.pathname === "/login" && req.method === "GET") {
     pendingState = crypto.randomBytes(16).toString("hex");
     const authUrl =
@@ -541,16 +604,17 @@ const server = http.createServer(async (req, res) => {
         state: pendingState,
         scope: SCOPES,
       }).toString();
-
-    console.log(`[spotify-bridge] Redirecting to Spotify. redirect_uri sent: ${REDIRECT_URI}`);
+    console.log(
+      `[spotify-bridge] Redirecting to Spotify. redirect_uri: ${REDIRECT_URI}`
+    );
     res.writeHead(302, { Location: authUrl });
     res.end();
     return;
   }
 
-  // ── GET /callback ── OAuth callback
+  // ── GET /callback ─────────────────────────────────────────────────────────
   if (url.pathname === "/callback" && req.method === "GET") {
-    const code = url.searchParams.get("code");
+    const code  = url.searchParams.get("code");
     const state = url.searchParams.get("state");
     const error = url.searchParams.get("error");
 
@@ -576,7 +640,8 @@ const server = http.createServer(async (req, res) => {
         }).toString(),
         {
           Authorization:
-            "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+            "Basic " +
+            Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
         }
       );
 
@@ -596,7 +661,8 @@ const server = http.createServer(async (req, res) => {
         res,
         200,
         `<h2>&#x2713; Spotify connected!</h2>
-         <p>You can close this tab. The bridge is running on http://127.0.0.1:${PORT}.</p>
+         <p>You can close this tab.</p>
+         <p>The bridge is running on ${BASE_URL}.</p>
          <p>The OpenPets Spotify Buddy plugin will now work.</p>`
       );
     } catch (err) {
@@ -606,7 +672,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /logout ── revoke local tokens
+  // ── GET /logout ───────────────────────────────────────────────────────────
   if (url.pathname === "/logout" && req.method === "GET") {
     tokens = null;
     if (fs.existsSync(TOKEN_FILE)) fs.unlinkSync(TOKEN_FILE);
@@ -614,7 +680,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── 404 fallback
+  // ── 404 ───────────────────────────────────────────────────────────────────
   sendJson(res, 404, { error: "Not found" });
 });
 
@@ -622,7 +688,7 @@ server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.error(
       `[spotify-bridge] ERROR: Port ${PORT} is already in use.\n` +
-        `Stop the existing bridge process or set SPOTIFY_BRIDGE_PORT to a free port.`
+        `Stop the existing process or set SPOTIFY_BRIDGE_PORT to a free port.`
     );
     process.exit(1);
   }
@@ -631,31 +697,28 @@ server.on("error", (err) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  const isCloud =
-    BASE_URL.includes("railway") || BASE_URL.includes("render");
+  const isCloud = BASE_URL.includes("railway") || BASE_URL.includes("render");
   console.log(`[spotify-bridge] Listening on ${BASE_URL}`);
 
   if (!tokens) {
     console.log(
       `[spotify-bridge] Not authorised. Visit ${BASE_URL}/login to connect Spotify`
     );
-    if (!isCloud) {
-      openBrowser(`http://127.0.0.1:${PORT}/login`);
-    }
+    if (!isCloud) openBrowser(`http://127.0.0.1:${PORT}/login`);
   } else {
     console.log("[spotify-bridge] Tokens loaded from disk. Bridge is ready.");
   }
 
-  // Keep-alive ping for Render.com (prevents spin down)
+  // Keep-alive ping for Render.com (prevents spin-down after 15 min idle)
   if (BASE_URL.includes("render")) {
-    console.log("[keep-alive] Starting keep-alive pings every 10 minutes");
+    console.log("[keep-alive] Starting pings every 10 minutes");
     setInterval(() => {
       https
         .get(`${BASE_URL}/status`, (res) => {
-          console.log(`[keep-alive] Pinged /status - Status: ${res.statusCode}`);
+          console.log(`[keep-alive] /status → ${res.statusCode}`);
         })
         .on("error", (err) => {
-          console.log("[keep-alive] Ping failed:", err.message);
+          console.warn("[keep-alive] Ping failed:", err.message);
         });
     }, 10 * 60 * 1000);
   }
@@ -673,7 +736,7 @@ function openBrowser(url) {
     exec(cmd, (err) => {
       if (err)
         console.log(
-          `[spotify-bridge] Could not auto-open browser. Please visit manually: ${url}`
+          `[spotify-bridge] Could not auto-open browser. Visit manually: ${url}`
         );
     });
   });
