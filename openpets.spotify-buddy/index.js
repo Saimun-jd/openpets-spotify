@@ -1,7 +1,7 @@
 // Spotify Buddy — OpenPets Plugin (manifestVersion 2, sdkVersion 1.0.0)
 
-const DEFAULT_POLL_INTERVAL_SECONDS = 2;
-const MIN_POLL_INTERVAL_SECONDS = 2;
+const DEFAULT_POLL_INTERVAL_SECONDS = 10;
+const MIN_POLL_INTERVAL_SECONDS = 5;
 const MAX_ANNOUNCEMENT_LENGTH = 140;
 const EMPTY_TRACK_ID = "__no_track__";
 
@@ -85,38 +85,48 @@ async function scheduleNextLyric(ctx) {
       continue;
     }
 
-    await ctx.schedule.once(LYRIC_SCHEDULE_ID, Math.max(0, delay), async () => {
-      if (activeLyrics !== activeLyricsRef) return;
+    const safeDelay = Math.max(0, Math.round(delay || 0));
+    if (isNaN(safeDelay) || !isFinite(safeDelay)) {
+      currentLyricIndex++;
+      continue;
+    }
 
-      const capturedIndex = currentLyricIndex;
-      const capturedLine = activeLyricsRef[capturedIndex];
-      if (!capturedLine) return;
+    try {
+      await ctx.schedule.once(LYRIC_SCHEDULE_ID, safeDelay, async () => {
+        if (activeLyrics !== activeLyricsRef) return;
 
-      const textToSpeak = sanitizeLyric(capturedLine.text);
-      if (!textToSpeak) return;
+        const capturedIndex = currentLyricIndex;
+        const capturedLine = activeLyricsRef[capturedIndex];
+        if (!capturedLine) return;
 
-      let durationMs = MIN_BUBBLE_MS;
-      for (let j = capturedIndex + 1; j < activeLyricsRef.length; j++) {
-        if (sanitizeLyric(activeLyricsRef[j].text)) {
-          durationMs = Math.max(MIN_BUBBLE_MS, activeLyricsRef[j].timestamp - capturedLine.timestamp - 50);
-          break;
+        const textToSpeak = sanitizeLyric(capturedLine.text);
+        if (!textToSpeak) return;
+
+        let durationMs = MIN_BUBBLE_MS;
+        for (let j = capturedIndex + 1; j < activeLyricsRef.length; j++) {
+          if (sanitizeLyric(activeLyricsRef[j].text)) {
+            durationMs = Math.max(MIN_BUBBLE_MS, activeLyricsRef[j].timestamp - capturedLine.timestamp - 50);
+            break;
+          }
         }
-      }
 
-      try {
-        await ctx.storage.set("spotify-lastLyricIndex", capturedIndex);
-        if (activeLyrics !== activeLyricsRef) return;
-        await ctx.pet.speak({ text: textToSpeak, durationMs });
-        if (activeLyrics !== activeLyricsRef) return;
-        await ctx.status.set({ text: `🎵 ${textToSpeak}`, tone: "info" });
-      } catch (e) {
-        ctx.log?.warn?.("Lyric speak error", e?.message);
-      }
+        try {
+          await ctx.storage.set("spotify-lastLyricIndex", capturedIndex);
+          if (activeLyrics !== activeLyricsRef) return;
+          await ctx.pet.speak({ text: textToSpeak, durationMs });
+          if (activeLyrics !== activeLyricsRef) return;
+          await ctx.status.set({ text: `🎵 ${textToSpeak}`, tone: "info" });
+        } catch (e) {
+          ctx.log?.warn?.("Lyric speak error", e?.message);
+        }
 
-      if (activeLyrics !== activeLyricsRef) return;
-      currentLyricIndex = capturedIndex + 1;
-      await scheduleNextLyric(ctx);
-    });
+        if (activeLyrics !== activeLyricsRef) return;
+        currentLyricIndex = capturedIndex + 1;
+        await scheduleNextLyric(ctx);
+      });
+    } catch (e) {
+      ctx.log?.warn?.("Schedule once failed", e?.message);
+    }
 
     break;
   }
