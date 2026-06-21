@@ -28,6 +28,11 @@
       "lrclib.net"
     ]
   },
+  "assets": {
+    "icons": {
+      "spotify": "assets/spotify.svg"
+    }
+  },
   "configSchema": {
     "spotifyClientId": {
       "type": "text",
