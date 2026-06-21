@@ -13,7 +13,8 @@ const MIN_BUBBLE_MS = 800;
 const LYRIC_SCHEDULE_PREFIX = "spotify-lyric-";
 
 let pollRunning = false;
-let activeLyricIds = [];
+let activeLyrics = [];
+let currentLyricIndex = -1;
 let scheduleWallBase = null;
 let scheduleProgressBase = null;
 
@@ -44,23 +45,91 @@ function format(template, values) {
 
 // ─── Lyric scheduling ─────────────────────────────────────────────────────────
 
+const LYRIC_SCHEDULE_ID = "spotify-lyric-next";
+
 async function cancelLyricSchedules(ctx) {
-  for (const id of activeLyricIds) {
-    try { await ctx.schedule.cancel(id); } catch (_) {}
-  }
-  activeLyricIds = [];
+  try { await ctx.schedule.cancel(LYRIC_SCHEDULE_ID); } catch (_) {}
+  activeLyrics = [];
+  currentLyricIndex = -1;
   scheduleWallBase = null;
   scheduleProgressBase = null;
+}
+
+async function scheduleNextLyric(ctx) {
+  try { await ctx.schedule.cancel(LYRIC_SCHEDULE_ID); } catch (_) {}
+
+  const activeLyricsRef = activeLyrics;
+
+  while (true) {
+    if (activeLyrics !== activeLyricsRef) return;
+    if (currentLyricIndex < 0 || currentLyricIndex >= activeLyricsRef.length) {
+      return;
+    }
+
+    const line = activeLyricsRef[currentLyricIndex];
+    const text = sanitizeLyric(line.text);
+    if (!text) {
+      currentLyricIndex++;
+      continue;
+    }
+
+    if (scheduleWallBase === null || scheduleProgressBase === null) {
+      return;
+    }
+
+    const currentProgressMs = scheduleProgressBase + (Date.now() - scheduleWallBase);
+    const delay = line.timestamp - currentProgressMs - SPEAK_LATENCY_MS;
+
+    if (delay < -200) {
+      currentLyricIndex++;
+      continue;
+    }
+
+    await ctx.schedule.once(LYRIC_SCHEDULE_ID, Math.max(0, delay), async () => {
+      if (activeLyrics !== activeLyricsRef) return;
+
+      const capturedIndex = currentLyricIndex;
+      const capturedLine = activeLyricsRef[capturedIndex];
+      if (!capturedLine) return;
+
+      const textToSpeak = sanitizeLyric(capturedLine.text);
+      if (!textToSpeak) return;
+
+      let durationMs = MIN_BUBBLE_MS;
+      for (let j = capturedIndex + 1; j < activeLyricsRef.length; j++) {
+        if (sanitizeLyric(activeLyricsRef[j].text)) {
+          durationMs = Math.max(MIN_BUBBLE_MS, activeLyricsRef[j].timestamp - capturedLine.timestamp - 50);
+          break;
+        }
+      }
+
+      try {
+        await ctx.storage.set("spotify-lastLyricIndex", capturedIndex);
+        if (activeLyrics !== activeLyricsRef) return;
+        await ctx.pet.speak({ text: textToSpeak, durationMs });
+        if (activeLyrics !== activeLyricsRef) return;
+        await ctx.status.set({ text: `🎵 ${textToSpeak}`, tone: "info" });
+      } catch (e) {
+        ctx.log?.warn?.("Lyric speak error", e?.message);
+      }
+
+      if (activeLyrics !== activeLyricsRef) return;
+      currentLyricIndex = capturedIndex + 1;
+      await scheduleNextLyric(ctx);
+    });
+
+    break;
+  }
 }
 
 async function scheduleLyrics(ctx, lyrics, progressMs) {
   await cancelLyricSchedules(ctx);
 
+  activeLyrics = lyrics;
   scheduleWallBase = Date.now();
   scheduleProgressBase = progressMs;
 
-  const newIds = [];
-
+  let targetIndex = -1;
   for (let i = 0; i < lyrics.length; i++) {
     const line = lyrics[i];
     const text = sanitizeLyric(line.text);
@@ -69,34 +138,18 @@ async function scheduleLyrics(ctx, lyrics, progressMs) {
     const delay = line.timestamp - progressMs - SPEAK_LATENCY_MS;
     if (delay < -200) continue;
 
-    let durationMs = MIN_BUBBLE_MS;
-    for (let j = i + 1; j < lyrics.length; j++) {
-      if (sanitizeLyric(lyrics[j].text)) {
-        durationMs = Math.max(MIN_BUBBLE_MS, lyrics[j].timestamp - line.timestamp - 50);
-        break;
-      }
-    }
-
-    const scheduleId = `${LYRIC_SCHEDULE_PREFIX}${i}`;
-    const capturedIndex = i;
-    const capturedText = text;
-    const capturedDuration = durationMs;
-
-    await ctx.schedule.once(scheduleId, Math.max(0, delay), async () => {
-      try {
-        await ctx.storage.set("spotify-lastLyricIndex", capturedIndex);
-        await ctx.pet.speak({ text: capturedText, durationMs: capturedDuration });
-        await ctx.status.set({ text: `🎵 ${capturedText}`, tone: "info" });
-      } catch (e) {
-        ctx.log?.warn?.("Lyric speak error", e?.message);
-      }
-    });
-
-    newIds.push(scheduleId);
+    targetIndex = i;
+    break;
   }
 
-  activeLyricIds = newIds;
-  ctx.log?.info?.("Lyrics scheduled", { total: lyrics.length, scheduled: newIds.length, fromMs: progressMs });
+  if (targetIndex !== -1) {
+    currentLyricIndex = targetIndex;
+    ctx.log?.info?.("Lyrics scheduling first tick", { index: targetIndex, text: lyrics[targetIndex].text, fromMs: progressMs });
+    await scheduleNextLyric(ctx);
+  } else {
+    currentLyricIndex = -1;
+    ctx.log?.info?.("No upcoming lyrics found to schedule", { total: lyrics.length, fromMs: progressMs });
+  }
 }
 
 function seekDriftDetected(nowProgressMs) {
