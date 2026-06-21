@@ -288,29 +288,39 @@ async function spotifyFetch(ctx, path, method = "GET", body = null) {
 }
 
 async function getLRCLIBLyrics(ctx, trackName, artistName, durationMs) {
-  try {
-    // 1. Try precise match
-    const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${Math.round(durationMs / 1000)}`;
-    let res = await ctx.net.fetch(url, { method: "GET" });
-    if (!res.json && res.text) {
-      try { res.json = JSON.parse(res.text); } catch (e) {}
-    }
-    if (res.ok && res.json) return res.json;
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      // 1. Try precise match
+      const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${Math.round(durationMs / 1000)}`;
+      let res = await ctx.net.fetch(url, { method: "GET" });
+      if (!res.json && res.text) {
+        try { res.json = JSON.parse(res.text); } catch (e) {}
+      }
+      if (res.ok && res.json) return res.json;
 
-    // 2. Fallback to broad search if exact match fails (common due to Spotify title formatting)
-    const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(trackName + " " + artistName)}`;
-    res = await ctx.net.fetch(searchUrl, { method: "GET" });
-    if (!res.json && res.text) {
-      try { res.json = JSON.parse(res.text); } catch (e) {}
+      // 2. Fallback to broad search
+      const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(trackName + " " + artistName)}`;
+      res = await ctx.net.fetch(searchUrl, { method: "GET" });
+      if (!res.json && res.text) {
+        try { res.json = JSON.parse(res.text); } catch (e) {}
+      }
+      
+      if (res.ok && res.json && res.json.length > 0) {
+        // Prefer a result with synced lyrics, otherwise just take the first one
+        const best = res.json.find(t => t.syncedLyrics) || res.json[0];
+        return best;
+      }
+      
+      // If no exception but we got here, we failed to find anything.
+      // Don't retry if it's a clean 404 (not found). Retries are for timeouts.
+      if (res.status === 404) return null;
+      
+    } catch (e) {
+      ctx.log?.warn?.(`LRCLIB error (attempt ${attempt + 1})`, e?.message);
+      if (attempt === maxRetries) return null;
+      // Continue to next iteration to retry immediately (good for cold starts)
     }
-    
-    if (res.ok && res.json && res.json.length > 0) {
-      // Prefer a result with synced lyrics, otherwise just take the first one
-      const best = res.json.find(t => t.syncedLyrics) || res.json[0];
-      return best;
-    }
-  } catch (e) {
-    ctx.log?.warn?.("LRCLIB error", e?.message);
   }
   return null;
 }
@@ -403,7 +413,11 @@ async function scheduleNext(ctx) {
   const delayMs = interval * 1000;
   await ctx.schedule.cancel("spotify-poll");
   await ctx.schedule.once("spotify-poll", delayMs, async () => {
-    await checkNow(ctx, false);
+    try {
+      await checkNow(ctx, false);
+    } catch (e) {
+      ctx.log?.warn?.("Background poll failed (e.g. network lost)", e?.message);
+    }
     await scheduleNext(ctx);
   });
 }
@@ -598,7 +612,9 @@ async function togglePausePlay(ctx) {
         await ctx.pet.react("celebrating");
         await ctx.status.set({ text: "Spotify: resuming…", tone: "success" });
         await ctx.schedule.once("spotify-resume-check", 1200, async () => {
-          await checkNow(ctx, false);
+          try {
+            await checkNow(ctx, false);
+          } catch (e) {}
         });
       } else {
         await ctx.ui.toast({ text: "Couldn't resume Spotify.", tone: "error" });
@@ -620,7 +636,9 @@ async function controlPlayback(ctx, path, method, message) {
     if (res.ok || res.status === 204) {
       await ctx.ui.toast({ text: message, tone: "info" });
       await ctx.schedule.once("spotify-skip-check", 800, async () => {
-        await checkNow(ctx, false);
+        try {
+          await checkNow(ctx, false);
+        } catch (e) {}
       });
     } else {
       await ctx.ui.toast({ text: "Playback control failed.", tone: "error" });
