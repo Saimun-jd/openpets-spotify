@@ -113,7 +113,20 @@ async function scheduleNextLyric(ctx) {
         try {
           await ctx.storage.set("spotify-lastLyricIndex", capturedIndex);
           if (activeLyrics !== activeLyricsRef) return;
-          await ctx.pet.speak({ text: textToSpeak, durationMs });
+          const bubble = await ctx.ui.bubble({
+            text: textToSpeak,
+            durationMs: durationMs,
+            actions: [
+              { id: "spotify-previous-track", label: "Prev", dismissesBubble: false },
+              { id: "spotify-pause-play", label: "Pause", dismissesBubble: false },
+              { id: "spotify-next-track", label: "Next", dismissesBubble: false }
+            ]
+          });
+          bubble.onAction(async (actionId) => {
+            if (actionId === "spotify-pause-play") await togglePausePlay(ctx);
+            else if (actionId === "spotify-next-track") await controlPlayback(ctx, "/me/player/next", "POST", "Playing next track!");
+            else if (actionId === "spotify-previous-track") await controlPlayback(ctx, "/me/player/previous", "POST", "Playing previous track!");
+          });
           if (activeLyrics !== activeLyricsRef) return;
           await ctx.status.set({ text: `🎵 ${textToSpeak}`, tone: "info" });
         } catch (e) {
@@ -500,7 +513,22 @@ async function checkNow(ctx, manual) {
         config.announceTemplate || "Now playing: {title} by {artist}",
         nowPlaying
       );
-      if (config.announceTrackChanges) await ctx.pet.speak(announcement);
+      if (config.announceTrackChanges) {
+        const bubble = await ctx.ui.bubble({
+          text: announcement,
+          durationMs: 8000,
+          actions: [
+            { id: "spotify-previous-track", label: "Prev", dismissesBubble: false },
+            { id: "spotify-pause-play", label: "Pause", dismissesBubble: false },
+            { id: "spotify-next-track", label: "Next", dismissesBubble: false }
+          ]
+        });
+        bubble.onAction(async (actionId) => {
+          if (actionId === "spotify-pause-play") await togglePausePlay(ctx);
+          else if (actionId === "spotify-next-track") await controlPlayback(ctx, "/me/player/next", "POST", "Playing next track!");
+          else if (actionId === "spotify-previous-track") await controlPlayback(ctx, "/me/player/previous", "POST", "Playing previous track!");
+        });
+      }
       await ctx.pet.react(config.reactToMood ? featuresToReaction(nowPlaying.features) : "celebrating");
 
       await ctx.storage.set("spotify-lastTrackId", nowPlaying.trackId);
@@ -591,7 +619,21 @@ async function togglePausePlay(ctx) {
       return;
     }
     if (res.status === 204 || !res.json) {
-      await ctx.pet.speak("No active playback session found to toggle.");
+      // Session expired or paused for a long time. Find a device to wake up and play!
+      const devicesRes = await spotifyFetch(ctx, "/me/player/devices");
+      if (devicesRes && devicesRes.json && devicesRes.json.devices && devicesRes.json.devices.length > 0) {
+        const device = devicesRes.json.devices.find(d => d.is_active) || devicesRes.json.devices[0];
+        const actionRes = await spotifyFetch(ctx, `/me/player/play?device_id=${device.id}`, "PUT");
+        if (actionRes.ok || actionRes.status === 204) {
+          await ctx.ui.toast({ text: "Waking up Spotify & Resuming!", tone: "success" });
+          await ctx.schedule.once("spotify-resume-check-wakeup", 1200, async () => {
+            try { await checkNow(ctx, false); } catch (e) {}
+          });
+          return;
+        }
+      }
+      
+      await ctx.pet.speak("Spotify is sleeping deeply! Please open the Spotify app manually first.");
       return;
     }
     
@@ -707,7 +749,6 @@ async function showLyrics(ctx) {
     await ctx.ui.bubble({
       text: final || "Lyrics couldn't be displayed.",
       durationMs: 12000,
-      icon: "sparkles",
       tone: "success"
     });
     

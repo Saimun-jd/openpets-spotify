@@ -19,7 +19,8 @@
     "status",
     "auth",
     "secrets",
-    "ui:toast"
+    "ui:toast",
+    "pet:interact"
   ],
   "network": {
     "hosts": [
