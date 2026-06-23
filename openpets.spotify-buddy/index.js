@@ -516,7 +516,7 @@ async function checkNow(ctx, manual) {
       if (config.announceTrackChanges) {
         const bubble = await ctx.ui.bubble({
           text: announcement,
-          durationMs: 8000,
+          durationMs: 4000,
           actions: [
             { id: "spotify-previous-track", label: "Prev", dismissesBubble: false },
             { id: "spotify-pause-play", label: "Pause", dismissesBubble: false },
@@ -535,7 +535,24 @@ async function checkNow(ctx, manual) {
       await ctx.storage.set("spotify-lastLyricIndex", -1);
 
       const lrclibData = await getLRCLIBLyrics(ctx, nowPlaying.title, nowPlaying.artist, nowPlaying.durationMs);
-      const syncedLyrics = parseSyncedLyrics(lrclibData?.syncedLyrics);
+      const rawSyncedLyrics = parseSyncedLyrics(lrclibData?.syncedLyrics);
+      
+      const titleLower = (nowPlaying.title || "").toLowerCase();
+      const artistLower = (nowPlaying.artist || "").toLowerCase();
+      
+      const syncedLyrics = rawSyncedLyrics.filter(l => {
+        const text = sanitizeLyric(l.text).toLowerCase();
+        if (!text) return false;
+        if (titleLower && text === titleLower) return false;
+        if (artistLower && text === artistLower) return false;
+        if (titleLower && artistLower) {
+          if (text === `${titleLower} - ${artistLower}` || text === `${artistLower} - ${titleLower}`) return false;
+          if (text === `${titleLower} by ${artistLower}`) return false;
+        }
+        if (text.includes("lyrics by") || text.includes("lyricist")) return false;
+        return true;
+      });
+
       ctx.log?.info?.("Lyrics loaded from LRCLIB", { count: syncedLyrics.length });
       
       // IPC messages have size limits. Only store the snippet we need for showLyrics.
